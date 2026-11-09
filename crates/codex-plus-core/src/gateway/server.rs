@@ -1546,6 +1546,18 @@ mod tests {
                 "/v1beta/models/m:generateContent".to_string()
             ))
         );
+        // 手动接入的 Trae CN：Chat / Responses 填 `/gw/trae-cn/v1`，Anthropic 填 `/gw/trae-cn`
+        // 后 Trae 自己拼 `/v1/messages`，三条都落到通用 Agent 的入口。
+        for (path, tail) in [
+            ("/gw/trae-cn/v1/chat/completions", "/chat/completions"),
+            ("/gw/trae-cn/v1/responses", "/responses"),
+            ("/gw/trae-cn/v1/messages", "/messages"),
+        ] {
+            assert_eq!(
+                split_gateway_path(path),
+                Some((ToolId::Unknown("trae-cn".to_string()), tail.to_string()))
+            );
+        }
         assert_eq!(split_gateway_path("/v1/messages"), None);
     }
 

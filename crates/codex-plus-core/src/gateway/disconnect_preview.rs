@@ -206,6 +206,10 @@ pub fn preview(
         collect_agent_sources(ctx, agent, &mut sources)?;
     } else if agents::is_manual(agent) {
         // 手动接入：Codex++ 没改过它的任何文件，断开只是关掉绑定，没有要预览的文件。
+        result.warnings = vec![
+            "Codex++ 没有改动这个 Agent 的任何文件；断开后网关对它的请求返回 503，API Key 保留，重新打开即可继续用。"
+                .into(),
+        ];
     } else if let Some(spec) = agents::spec(agent.as_str()) {
         generic_preview(ctx, spec, &mut sources, &mut result)?;
     } else if matches!(agent, ToolId::Claude | ToolId::Grok | ToolId::Codex) {

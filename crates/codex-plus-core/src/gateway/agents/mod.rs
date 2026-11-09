@@ -16,6 +16,7 @@
 pub mod catalog_apps;
 pub mod catalog_cli;
 pub mod catalog_core;
+pub mod catalog_manual;
 pub mod catalog_tools;
 pub mod connect;
 pub mod env;
@@ -162,6 +163,7 @@ pub fn all() -> &'static [&'static AgentSpec] {
             .chain(catalog_cli::SPECS)
             .chain(catalog_tools::SPECS)
             .chain(catalog_apps::SPECS)
+            .chain(catalog_manual::SPECS)
             .collect()
     })
 }
