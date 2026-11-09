@@ -107,6 +107,8 @@ pub struct GatewayAgentView {
     pub diagnostics: Option<codex_plus_core::gateway::diagnostics::AgentDiagnostics>,
     /// Agent 自带的模型（用它自己的登录或 Key 直连厂商，不经 Codex++）；没有时为 None。
     pub own_models: Option<codex_plus_core::gateway::own_models::OwnModels>,
+    /// 手动接入（如 Trae CN）：界面上的接入指引；有它时行里不放模型下拉，也不显示改动的配置文件。
+    pub manual: Option<codex_plus_core::gateway::agents::connect::ManualGuide>,
 }
 
 /// 界面上的自动组：组本身 + 是否隐藏 + 有没有改过设置。
@@ -329,11 +331,35 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
     let drift_ctx = ApplyContext::default_paths(port);
     let helper_running = codex_plus_core::resident_helper::resident_helper_port().is_some();
     let activity = activity::snapshot();
-    let agents = listed_agents(&gateway)
+    let listed = listed_agents(&gateway);
+    // 手动接入的「已接入」看持久化的用量；列表里有手动接入的 Agent 时才读一次文件。
+    // 指引里的模型要和网关路由时看到的一致：网关用的是带拓展供应商的设置。
+    let (seen, routed) = if listed.iter().any(codex_plus_core::gateway::agents::is_manual) {
+        (
+            codex_plus_core::gateway::usage::UsageStore::default()
+                .seen_agents()
+                .unwrap_or_default(),
+            Some(gateway.clone().with_extension_providers()),
+        )
+    } else {
+        (Default::default(), None)
+    };
+    let agents = listed
         .iter()
         .map(|agent| {
             let binding = gateway.binding(agent);
             let enabled = binding.is_some_and(|binding| binding.enabled);
+            let manual = codex_plus_core::gateway::agents::spec(agent.as_str())
+                .zip(routed.as_ref())
+                .and_then(|(spec, routed)| {
+                codex_plus_core::gateway::agents::connect::manual_guide(
+                    spec,
+                    routed,
+                    binding,
+                    port,
+                    seen.contains(spec.id),
+                )
+            });
             GatewayAgentView {
                 agent: agent.as_str().to_string(),
                 name: codex_plus_core::tools::tool_display_name(agent).to_string(),
@@ -343,13 +369,15 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                     .map(|spec| spec.hint.to_string())
                     .unwrap_or_default(),
                 enabled,
-                requires_disconnect_preview: enabled
+                // 手动接入没有文件要还原，断开不需要预览。
+                requires_disconnect_preview: manual.is_none()
+                    && (enabled
                     || match agent {
                         ToolId::Codex => settings.active_relay_id == apply::CODEX_GATEWAY_RELAY_ID,
                         ToolId::Claude => claude::current_provider_id(&drift_ctx.claude)
                             .is_ok_and(|id| id == GATEWAY_PROVIDER_ID),
                         _ => false,
-                    },
+                    }),
                 base_url: apply::gateway_base_url(port, agent),
                 default_model: binding
                     .map(|binding| apply::resolved_default_model(&gateway, binding))
@@ -374,6 +402,7 @@ fn build_payload(settings: &BackendSettings, gateway: GatewaySettings) -> Gatewa
                 own_models: codex_plus_core::gateway::own_models::own_models(
                     &drift_ctx, agent, binding,
                 ),
+                manual,
             }
         })
         .collect();
@@ -822,9 +851,15 @@ pub fn save_gateway_binding(
         }
         Ok(saved)
     })();
-    let name = codex_plus_core::tools::tool_display_name(&ToolId::parse(&agent));
+    let parsed = ToolId::parse(&agent);
+    let name = codex_plus_core::tools::tool_display_name(&parsed);
+    let done = if codex_plus_core::gateway::agents::is_manual(&parsed) {
+        format!("{name} 已开启接入，按「接入指引」在 {name} 里添加模型。")
+    } else {
+        format!("{name} 已接入 Codex++ 网关，新开的会话生效。")
+    };
     respond(
-        &format!("{name} 已接入 Codex++ 网关，新开的会话生效。"),
+        &done,
         "接入网关失败",
         result,
     )
@@ -838,12 +873,23 @@ pub fn disable_gateway_binding(
 ) -> CommandResult<Option<GatewayPayload>> {
     let result = (|| {
         let agent = parse_agent(&agent)?;
+        // 手动接入没有文件要还原：断开只是关掉绑定（token 保留），不需要预览确认。
+        if codex_plus_core::gateway::agents::is_manual(&agent) {
+            let settings = SettingsStore::default().load()?;
+            return apply::disable_binding(&context(), &settings, &agent);
+        }
         let (ctx, settings) = validate_disconnect_preview(&agent, preview_token.as_deref())?;
         apply::disable_binding(&ctx, &settings, &agent)
     })();
-    let name = codex_plus_core::tools::tool_display_name(&ToolId::parse(&agent));
+    let parsed = ToolId::parse(&agent);
+    let name = codex_plus_core::tools::tool_display_name(&parsed);
+    let done = if codex_plus_core::gateway::agents::is_manual(&parsed) {
+        format!("{name} 已暂停接入：网关对它的请求返回 503，API Key 保留，重新打开即可继续用。")
+    } else {
+        format!("{name} 已断开并还原，新开的会话生效。")
+    };
     respond(
-        &format!("{name} 已断开并还原，新开的会话生效。"),
+        &done,
         "断开失败",
         result,
     )
@@ -903,7 +949,14 @@ pub fn rotate_gateway_token(agent: String) -> CommandResult<Option<GatewayPayloa
         }
         Ok(gateway)
     })();
-    respond("已更换网关 token。", "更换网关 token 失败", result)
+    let parsed = ToolId::parse(&agent);
+    let done = if codex_plus_core::gateway::agents::is_manual(&parsed) {
+        let name = codex_plus_core::tools::tool_display_name(&parsed);
+        format!("已更换网关 token。请到 {name} 里把每个自定义模型的 API Key 换成新的。")
+    } else {
+        "已更换网关 token。".to_string()
+    };
+    respond(&done, "更换网关 token 失败", result)
 }
 
 /// 网关全局选项：Key 轮换方式、退出时恢复直连。
@@ -1923,6 +1976,9 @@ pub fn reveal_gateway_agent_config(agent: String) -> CommandResult<Option<Gatewa
         let agent = parse_agent(&agent)?;
         let env = codex_plus_core::gateway::agents::AgentEnv::current();
         let path = match codex_plus_core::gateway::agents::spec(agent.as_str()) {
+            Some(spec) if spec.manual.is_some() => {
+                anyhow::bail!("{} 由用户在应用里手动配置，Codex++ 没有改动它的文件", spec.name)
+            }
             Some(spec) => (spec.config_path)(&env),
             None => env.expand(&agent_config_path(&agent)),
         };
@@ -1961,6 +2017,8 @@ fn agent_config_path(agent: &ToolId) -> String {
         ToolId::Grok => codex_plus_core::gateway::agents::AgentEnv::current()
             .display(&codex_plus_core::grok_config::default_grok_home_dir().join("config.toml")),
         other => match codex_plus_core::gateway::agents::spec(other.as_str()) {
+            // 手动接入没有配置文件，界面据此不显示「改动了 <文件>」。
+            Some(spec) if spec.manual.is_some() => String::new(),
             Some(spec) => {
                 let env = codex_plus_core::gateway::agents::AgentEnv::current();
                 env.display(&(spec.config_path)(&env))
@@ -2075,6 +2133,15 @@ fn parse_version(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_version;
+
+    #[test]
+    fn manual_agents_have_no_config_path() {
+        use codex_plus_core::tools::ToolId;
+        let trae = ToolId::Unknown("trae-cn".to_string());
+        assert_eq!(super::agent_config_path(&trae), "");
+        assert!(codex_plus_core::gateway::agents::is_manual(&trae));
+        assert!(!codex_plus_core::gateway::agents::is_manual(&ToolId::Unknown("workbuddy".into())));
+    }
 
     #[test]
     fn agent_config_paths_follow_the_write_directories() {
