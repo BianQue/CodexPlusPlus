@@ -507,6 +507,7 @@ pub const OPENCHAMBER: AgentSpec = AgentSpec {
     config_path: |env| openchamber_dir(env).join("preferences.json"),
     write: write_openchamber,
     hint: "新会话用 Codex++ 的模型，已打开的会话保持原模型；也可在模型列表里选「Codex++ · OpenChamber」下的模型",
+    manual: None,
 };
 
 fn mimo_dir(env: &AgentEnv) -> PathBuf {
@@ -529,6 +530,7 @@ pub const MIMO_CODE: AgentSpec = AgentSpec {
     config_path: mimo_path,
     write: |env, wiring, set| write_opencode_style(&mimo_path(env), wiring, set),
     hint: "在 MiMo Code 里用 /models 选 Codex++ 下的模型",
+    manual: None,
 };
 
 fn deveco_dir(env: &AgentEnv) -> PathBuf {
@@ -548,6 +550,7 @@ pub const DEVECO_CODE: AgentSpec = AgentSpec {
     config_path: deveco_path,
     write: |env, wiring, set| write_opencode_style(&deveco_path(env), wiring, set),
     hint: "在 DevEco Code 里用 /models 选 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Pi 系
@@ -610,6 +613,7 @@ pub const PI: AgentSpec = AgentSpec {
     config_path: |env| pi_dir(env).join("settings.json"),
     write: |env, wiring, set| write_pi_family(&pi_dir(env), wiring, set),
     hint: "新开 Pi 会话生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 fn omo_dir(env: &AgentEnv) -> PathBuf {
@@ -626,6 +630,7 @@ pub const OMO: AgentSpec = AgentSpec {
     config_path: |env| omo_dir(env).join("settings.json"),
     write: |env, wiring, set| write_pi_family(&omo_dir(env), wiring, set),
     hint: "新开 OmO 会话生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 fn prime_agent_dir(env: &AgentEnv) -> PathBuf {
@@ -642,6 +647,7 @@ pub const PRIME_AGENT: AgentSpec = AgentSpec {
     config_path: |env| prime_agent_dir(env).join("settings.json"),
     write: |env, wiring, set| write_pi_family(&prime_agent_dir(env), wiring, set),
     hint: "重启 Prime Agent 后生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 /// StepCode 的目录：`STEP_CODING_AGENT_DIR`（绝对路径）的上一级，或用户目录下的
@@ -680,6 +686,7 @@ pub const STEPCODE: AgentSpec = AgentSpec {
     config_path: |env| stepcode_dir(env).join("config.toml"),
     write: write_stepcode,
     hint: "重启 StepCode 或新开会话后生效；项目里的 .stepcode/config.toml 会覆盖全局选择",
+    manual: None,
 };
 
 /// Aside 当前账号的目录：`~/.aside/accounts.json` 的 `currentAccountId`，默认 0 号账号。
@@ -709,6 +716,7 @@ pub const ASIDE: AgentSpec = AgentSpec {
     // 选中的模型在运行中的 Aside 里改（它的设置由应用自己维护），这里只登记模型列表。
     write: |env, wiring, set| write_pi_models(&aside_dir(env).join("models.json"), wiring, set),
     hint: "重启 Aside 后在模型设置里选 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- omp（oh-my-pi）
@@ -807,6 +815,7 @@ pub const OMP: AgentSpec = AgentSpec {
     config_path: |env| omp_yaml(&omp_dir(env), "config"),
     write: write_omp,
     hint: "重启 omp 后生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- MothX
@@ -847,6 +856,7 @@ pub const MOTHX: AgentSpec = AgentSpec {
     config_path: |env| mothx_dir(env).join("settings.json"),
     write: write_mothx,
     hint: "重启 MothX 后生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- PenguinHarness
@@ -909,6 +919,7 @@ pub const PENGUIN: AgentSpec = AgentSpec {
     config_path: penguin_path,
     write: write_penguin,
     hint: "PenguinHarness 会自动重读配置，无需重启",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Copilot CLI
@@ -967,6 +978,7 @@ pub const COPILOT_CLI: AgentSpec = AgentSpec {
     config_path: |env| copilot_dir(env).join("settings.json"),
     write: write_copilot,
     hint: "重启 Copilot CLI 后生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Crush
@@ -1055,6 +1067,7 @@ pub const CRUSH: AgentSpec = AgentSpec {
     config_path: crush_config_path,
     write: write_crush,
     hint: "重启 Crush 后生效，用 Ctrl+L 切换 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Command Code
@@ -1097,6 +1110,7 @@ pub const COMMAND_CODE: AgentSpec = AgentSpec {
     config_path: |env| command_code_dir(env).join("settings.json"),
     write: write_command_code,
     hint: "仍需先用 command-code login 登录；重启后用 /model 选 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Kimi Code
@@ -1171,6 +1185,7 @@ pub const KIMI_CODE: AgentSpec = AgentSpec {
     config_path: kimi_path,
     write: write_kimi,
     hint: "重启 Kimi Code 后生效，用 /model 选 codexplus 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Qwen Code
@@ -1231,6 +1246,7 @@ pub const QWEN_CODE: AgentSpec = AgentSpec {
     config_path: |env| qwen_dir(env).join("settings.json"),
     write: write_qwen,
     hint: "重启 Qwen Code 后生效，用 /model 切换模型",
+    manual: None,
 };
 
 #[cfg(test)]

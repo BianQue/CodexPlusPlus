@@ -10,6 +10,8 @@
 //!
 //! 新增 Agent：在 `catalog_*.rs` 里写一条规格并登记到该文件的 `SPECS`；
 //! 写配置时供应商名统一用 [`PROVIDER_ID`]，地址用 [`Wiring`] 给的，不要硬编码端口。
+//! 配置不在本地文件里（存在云端账号）的应用用手动接入：规格带 [`AgentSpec::manual`]，
+//! Codex++ 只签发 token、路由、记用量，用户照界面上的接入指引在应用里自己填。
 
 pub mod catalog_apps;
 pub mod catalog_cli;
@@ -44,6 +46,36 @@ pub enum AgentWire {
     Anthropic,
     /// Gemini generateContent（`<root>/v1beta/models/...`；Agent 填根地址 `<root>`）。
     Gemini,
+}
+
+impl AgentWire {
+    /// Agent 里该填的 Base URL：OpenAI 两种带 `/v1`，Anthropic / Gemini 填根地址（客户端自己拼 `/v1/...`）。
+    pub fn base_url(self, root: &str) -> String {
+        match self {
+            AgentWire::Chat | AgentWire::Responses => format!("{root}/v1"),
+            AgentWire::Anthropic | AgentWire::Gemini => root.to_string(),
+        }
+    }
+}
+
+/// 手动接入：配置存在 Agent 自己的云端账号里，没有可写的文件。Codex++ 只给出地址、token 和模型，
+/// 用户在 Agent 界面里自己填；路由、token、用量与写文件的通用 Agent 完全一样（`/gw/<id>`）。
+pub struct ManualConnect {
+    /// 在 Agent 里添加模型的菜单路径，如 `AI 设置 → 模型 → 添加模型 → 自定义`。
+    pub menu_path: &'static str,
+    /// 接入指引里逐条显示的提醒。
+    pub notes: &'static [&'static str],
+    /// 接入指引列出的协议，按显示顺序。
+    pub wires: &'static [AgentWire],
+    pub install: InstallPaths,
+}
+
+/// 手动接入的 Agent 的安装位置：只看存在与否，不读内容。
+pub struct InstallPaths {
+    /// `%LOCALAPPDATA%` 下的相对路径，如 `Programs/Trae CN/Trae CN.exe`。
+    pub windows_local_app_data: &'static [&'static str],
+    /// `.app` 名，在 `~/Applications` 与 `/Applications` 下找。
+    pub mac_apps: &'static [&'static str],
 }
 
 /// 写进 Agent 配置的一个模型。
@@ -110,6 +142,9 @@ pub struct AgentSpec {
     pub write: fn(&AgentEnv, &Wiring, &mut FileSet) -> anyhow::Result<()>,
     /// 在 Agent 里怎么切模型、接入后要不要重启等提示；没有为空。
     pub hint: &'static str,
+    /// 手动接入（见 [`ManualConnect`]）：不写、不读、不还原任何 Agent 文件，也不检测漂移；
+    /// 这时 `config_path` 返回空路径，`write` 为空操作。None 为写配置文件的接入。
+    pub manual: Option<&'static ManualConnect>,
 }
 
 impl std::fmt::Debug for AgentSpec {
@@ -140,12 +175,33 @@ pub fn is_generic(agent: &crate::tools::ToolId) -> bool {
     matches!(agent, crate::tools::ToolId::Unknown(id) if spec(id).is_some())
 }
 
+/// 是不是手动接入的通用 Agent（见 [`ManualConnect`]）。
+pub fn is_manual(agent: &crate::tools::ToolId) -> bool {
+    matches!(agent, crate::tools::ToolId::Unknown(id)
+        if spec(id).is_some_and(|spec| spec.manual.is_some()))
+}
+
+/// 手动接入的 Agent 装在本机：只检查安装位置存在，不读任何内容。
+pub fn installed_at(env: &AgentEnv, paths: &InstallPaths) -> bool {
+    match env.os {
+        Os::Windows => paths
+            .windows_local_app_data
+            .iter()
+            .any(|relative| env.local_app_data().join(relative).is_file()),
+        Os::Mac => catalog_apps::mac_app(env, paths.mac_apps),
+        Os::Linux => false,
+    }
+}
+
 /// 本机真的装了（或配置过）这个 Agent：规格自己的探测通过，并且有它的命令、它的配置文件，
 /// 或者配置所在的目录是 Agent 自己建的——目录里只剩 `logs`、`cache` 这类运行时残留（卸载后留下的）
-/// 或别的工具顺手建的 `skills` 时不算。
+/// 或别的工具顺手建的 `skills` 时不算。手动接入的没有配置文件，只认探测（看的就是安装位置）。
 pub fn installed(spec: &AgentSpec, env: &AgentEnv) -> bool {
     if !(spec.detect)(env) {
         return false;
+    }
+    if spec.manual.is_some() {
+        return true;
     }
     if env.has_binary(spec.binary) {
         return true;
@@ -187,6 +243,44 @@ mod tests {
         std::fs::write(dir.join("settings.json"), "{}").unwrap();
         assert!(agent_dir(&dir));
         assert!(!agent_dir(&temp.path().join("missing")));
+    }
+
+    #[test]
+    fn wire_base_url_matches_what_clients_append() {
+        let root = "http://127.0.0.1:57321/gw/x";
+        assert_eq!(AgentWire::Chat.base_url(root), format!("{root}/v1"));
+        assert_eq!(AgentWire::Responses.base_url(root), format!("{root}/v1"));
+        assert_eq!(AgentWire::Anthropic.base_url(root), root);
+        assert_eq!(AgentWire::Gemini.base_url(root), root);
+    }
+
+    #[test]
+    fn installed_at_only_looks_at_install_locations() {
+        const PATHS: InstallPaths = InstallPaths {
+            windows_local_app_data: &["Programs/Demo/Demo.exe"],
+            mac_apps: &["Demo.app"],
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let local = temp.path().join("Local");
+        let windows = AgentEnv::at(home.clone())
+            .with_os(Os::Windows)
+            .with_var("LOCALAPPDATA", local.to_str().unwrap());
+        assert!(!installed_at(&windows, &PATHS));
+        let exe = local.join("Programs").join("Demo").join("Demo.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"MZ").unwrap();
+        assert!(installed_at(&windows, &PATHS));
+
+        let mac = AgentEnv::at(home.clone()).with_os(Os::Mac);
+        assert!(!installed_at(&mac, &PATHS));
+        std::fs::create_dir_all(home.join("Applications").join("Demo.app")).unwrap();
+        assert!(installed_at(&mac, &PATHS));
+
+        assert!(!installed_at(
+            &AgentEnv::at(home.clone()).with_os(Os::Linux),
+            &PATHS
+        ));
     }
 
     #[test]

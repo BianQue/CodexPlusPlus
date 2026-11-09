@@ -93,7 +93,8 @@ fn snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
 
 #[test]
 fn every_generic_agent_connects_and_restores_exactly() {
-    for spec in agents::all() {
+    // 手动接入不写配置，没有 `/gw/<id>` 可找；见 gateway_manual_agents.rs。
+    for spec in agents::all().iter().filter(|spec| spec.manual.is_none()) {
         let fixture = fixture();
         let ctx = &fixture.ctx;
         let agent = ToolId::Unknown(spec.id.to_string());

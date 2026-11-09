@@ -201,6 +201,9 @@ pub fn inspect(
             ToolId::Claude => claude(&mut config, binding),
             ToolId::Grok => grok(&mut config, binding),
             _ => match agents::spec(agent.as_str()) {
+                // 手动接入：没有配置可核对，状态只由 helper 和流量决定。不看安装文件的修改时间，
+                // 否则 Agent 自动更新后，之前的请求会被判成「早于配置」。
+                Some(spec) if spec.manual.is_some() => {}
                 Some(spec) => generic(&mut config, spec, gateway, binding),
                 None => config.add(Path::new(""), "", "unsupported_agent", None, None),
             },

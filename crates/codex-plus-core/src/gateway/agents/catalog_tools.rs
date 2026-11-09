@@ -94,6 +94,7 @@ pub const GEMINI_CLI: AgentSpec = AgentSpec {
     config_path: gemini_path,
     write: write_gemini,
     hint: "Gemini CLI 启动时读配置，接入后重开 gemini；临时换模型用 gemini -m <模型>",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Goose
@@ -178,6 +179,7 @@ pub const GOOSE: AgentSpec = AgentSpec {
     config_path: goose_path,
     write: write_goose,
     hint: "Goose 启动时加载供应商，接入后重启 Goose；在它的模型设置里可换 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- DeepSeek Harness (dsh)
@@ -493,6 +495,7 @@ pub const REASONIX: AgentSpec = AgentSpec {
     config_path: reasonix_path,
     write: write_reasonix,
     hint: "在 Reasonix 里选 Codex++ 下的模型；接入后重启 Studio 或 reasonix",
+    manual: None,
 };
 
 pub const DSH: AgentSpec = AgentSpec {
@@ -504,6 +507,7 @@ pub const DSH: AgentSpec = AgentSpec {
     config_path: dsh_path,
     write: write_dsh,
     hint: "在 dsh 的模型列表里选 Codex++ 下的模型；新会话生效",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Hermes Agent
@@ -563,6 +567,7 @@ pub const HERMES: AgentSpec = AgentSpec {
     config_path: hermes_path,
     write: write_hermes,
     hint: "用 hermes model 或会话里的模型选择器换 Codex++ 下的模型；接入后重开 hermes",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Mister Morph
@@ -603,6 +608,7 @@ pub const MISTER_MORPH: AgentSpec = AgentSpec {
     config_path: morph_path,
     write: write_morph,
     hint: "Mister Morph 只用一个模型，换模型请在 Codex++ 里改；接入后重开 morph",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- jcode
@@ -652,6 +658,7 @@ pub const JCODE: AgentSpec = AgentSpec {
     config_path: jcode_path,
     write: write_jcode,
     hint: "在 jcode 里用 /model 选 Codex++ 下的模型；接入后重启 jcode",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Empryo
@@ -720,6 +727,7 @@ pub const EMPRYO: AgentSpec = AgentSpec {
     config_path: empryo_path,
     write: write_empryo,
     hint: "在 Empryo 的模型选择里选 Codex++ 下的模型；接入后重启 empryo",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- MiniMax Code
@@ -769,6 +777,7 @@ pub const MINIMAX_CODE: AgentSpec = AgentSpec {
     config_path: minimax_path,
     write: write_minimax,
     hint: "在 mcode 里用 /model 选 Codex++ 下的模型；接入后重启 mcode",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Droid (Factory)
@@ -853,6 +862,7 @@ pub const DROID: AgentSpec = AgentSpec {
     config_path: droid_path,
     write: write_droid,
     hint: "在 droid 里用 /model 的自定义模型里选 Codex++ 下的模型；新会话生效",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Cline (CLI)
@@ -937,6 +947,7 @@ pub const CLINE: AgentSpec = AgentSpec {
     config_path: cline_path,
     write: write_cline,
     hint: "Cline 在会话开始时读配置，新开的 cline 会话生效",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Qoder / Qoder CN
@@ -995,6 +1006,7 @@ pub const QODER: AgentSpec = AgentSpec {
     config_path: qoder_path,
     write: |env, wiring, set| write_qoder_at(&qoder_path(env), wiring, set),
     hint: "在 qodercli 里用 /model 选 Codex++ 下的模型（套餐需支持自带 Key）；接入后重开 qodercli",
+    manual: None,
 };
 
 pub const QODER_CN: AgentSpec = AgentSpec {
@@ -1006,6 +1018,7 @@ pub const QODER_CN: AgentSpec = AgentSpec {
     config_path: qoder_cn_path,
     write: |env, wiring, set| write_qoder_at(&qoder_cn_path(env), wiring, set),
     hint: "在 qoderclicn 里用 /model 选 Codex++ 下的模型（套餐需支持自带 Key）；接入后重开 qoderclicn",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Grok App
@@ -1089,6 +1102,7 @@ pub const GROK_APP: AgentSpec = AgentSpec {
     config_path: grok_app_path,
     write: write_grok_app,
     hint: "在 Grok App 的设置 › 供应商里对 Codex++ 点「使用」，再在对话里选模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- ZCode
@@ -1196,6 +1210,7 @@ pub const ZCODE: AgentSpec = AgentSpec {
     config_path: zcode_path,
     write: write_zcode,
     hint: "在 ZCode 的模型选择器里选 Codex++ 下的模型；接入后重启 ZCode",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- WorkBuddy / WorkBuddy AI / CodeBuddy
@@ -1381,6 +1396,7 @@ pub const WORKBUDDY: AgentSpec = AgentSpec {
     config_path: workbuddy_path,
     write: |env, wiring, set| write_buddy_models(&workbuddy_path(env), wiring, set),
     hint: "在 WorkBuddy 的模型选择器里选 Codex++ 的模型；接入后重启 WorkBuddy",
+    manual: None,
 };
 
 pub const WORKBUDDY_AI: AgentSpec = AgentSpec {
@@ -1392,6 +1408,7 @@ pub const WORKBUDDY_AI: AgentSpec = AgentSpec {
     config_path: workbuddy_ai_path,
     write: |env, wiring, set| write_buddy_models(&workbuddy_ai_path(env), wiring, set),
     hint: "在 WorkBuddy AI 的模型选择器里选 Codex++ 的模型；接入后重启 WorkBuddy AI",
+    manual: None,
 };
 
 fn codebuddy_dir(env: &AgentEnv) -> PathBuf {
@@ -1420,6 +1437,7 @@ pub const CODEBUDDY: AgentSpec = AgentSpec {
     config_path: codebuddy_path,
     write: write_codebuddy,
     hint: "在 CodeBuddy 里用 /model 选 Codex++ 的模型；新会话生效",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- AtomCode
@@ -1472,6 +1490,7 @@ pub const ATOMCODE: AgentSpec = AgentSpec {
     config_path: atomcode_path,
     write: write_atomcode,
     hint: "在 AtomCode 里用 /model 选 codexplus/ 开头的模型；接入后重启 atomcode",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Snow CLI
@@ -1562,6 +1581,7 @@ pub const SNOW: AgentSpec = AgentSpec {
     config_path: snow_path,
     write: write_snow,
     hint: "已切到 Codex++ 配置档，接入后重开 snow；Snow App 可用「同步 Snow CLI API 配置」导入",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Ante
@@ -1615,6 +1635,7 @@ pub const ANTE: AgentSpec = AgentSpec {
     config_path: ante_path,
     write: write_ante,
     hint: "在 Ante 的模型选择器里选 Codex++ 下的模型；接入后重启 ante",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- 工具：JSON

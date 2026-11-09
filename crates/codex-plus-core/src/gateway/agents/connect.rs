@@ -4,11 +4,14 @@
 //!   存档放在 `<状态目录>/backups/agent-<id>-before-gateway.json`，只给本人读写。
 //! - 断开：按存档把网关改过的键改回去，接入期间 Agent 自己写的其它内容保留。
 //! - 漂移：存档还在（Codex++ 认为它接在网关上），但配置文件里已经找不到网关地址。
+//! - 手动接入（规格带 `manual`）：以上都不做，不碰任何文件；界面用 [`manual_guide`] 给出接入指引。
 
 use std::path::PathBuf;
 
 use crate::gateway::agents::files::{self, AgentStash, FileSet};
-use crate::gateway::agents::{AgentSpec, ModelEntry, Wiring};
+use serde::Serialize;
+
+use crate::gateway::agents::{AgentSpec, AgentWire, ModelEntry, Wiring};
 use crate::gateway::apply::{ApplyContext, gateway_base_url};
 use crate::gateway::drift::Drift;
 use crate::gateway::restore as stash;
@@ -53,6 +56,68 @@ pub fn wiring(
     }
 }
 
+/// 接入指引里的一种协议：Agent 里选这个格式时该填的 Base URL。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualEndpoint {
+    pub wire: AgentWire,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualModel {
+    pub id: String,
+    pub display_name: String,
+}
+
+/// 手动接入的 Agent 在界面上的接入指引。API Key 不在这里：界面从绑定里读 token。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualGuide {
+    pub menu_path: String,
+    pub notes: Vec<String>,
+    pub endpoints: Vec<ManualEndpoint>,
+    pub models: Vec<ManualModel>,
+    /// 用量里见过这个 Agent 的请求（界面显示「已接入」）。
+    pub seen: bool,
+}
+
+/// 手动接入的指引；不是手动接入的规格返回 None。模型与写配置的 Agent 同一来源（[`wiring`]），
+/// ID 完全一致。`binding` 为 None（从没打开过）时按默认绑定列，用户打开开关前也能先看。
+pub fn manual_guide(
+    spec: &AgentSpec,
+    gateway: &GatewaySettings,
+    binding: Option<&AgentBinding>,
+    port: u16,
+    seen: bool,
+) -> Option<ManualGuide> {
+    let manual = spec.manual?;
+    let fallback = AgentBinding::default();
+    let wiring = wiring(gateway, binding.unwrap_or(&fallback), spec.id, port);
+    Some(ManualGuide {
+        menu_path: manual.menu_path.to_string(),
+        notes: manual.notes.iter().map(|note| note.to_string()).collect(),
+        endpoints: manual
+            .wires
+            .iter()
+            .map(|&wire| ManualEndpoint {
+                wire,
+                base_url: wire.base_url(&wiring.root),
+            })
+            .collect(),
+        models: wiring
+            .models
+            .into_iter()
+            .map(|model| ManualModel {
+                id: model.id,
+                display_name: model.display_name,
+            })
+            .collect(),
+        seen,
+    })
+}
+
 /// 把 Agent 的配置指向网关。已经接着时再写一遍（模型列表变了），改到的键追加进原有存档。
 pub fn write(
     ctx: &ApplyContext,
@@ -60,6 +125,9 @@ pub fn write(
     gateway: &GatewaySettings,
     binding: &AgentBinding,
 ) -> anyhow::Result<()> {
+    if spec.manual.is_some() {
+        return Ok(());
+    }
     let wiring = wiring(gateway, binding, spec.id, ctx.port);
     let mut set = FileSet::new();
     (spec.write)(&ctx.agent_env, &wiring, &mut set)?;
@@ -82,6 +150,9 @@ pub fn write(
 
 /// 断开：把网关改过的键改回接入前的值，然后删掉存档。没有存档时什么都不做。
 pub fn restore(ctx: &ApplyContext, spec: &AgentSpec) -> anyhow::Result<()> {
+    if spec.manual.is_some() {
+        return Ok(());
+    }
     let path = stash_path(ctx, spec.id);
     let Some(agent_stash) = stash::load_stash::<AgentStash>(&path) else {
         return Ok(());
@@ -123,16 +194,23 @@ pub fn restore(ctx: &ApplyContext, spec: &AgentSpec) -> anyhow::Result<()> {
 
 /// 配置已被别的工具改走时的断开：不碰 Agent 的文件，只丢掉存档。
 pub fn forget(ctx: &ApplyContext, spec: &AgentSpec) {
+    if spec.manual.is_some() {
+        return;
+    }
     stash::remove_stash(&stash_path(ctx, spec.id));
 }
 
 /// Codex++ 的记录里它还接在网关上（存档还在）。
 pub fn recorded(ctx: &ApplyContext, spec: &AgentSpec) -> bool {
-    stash_path(ctx, spec.id).exists()
+    spec.manual.is_none() && stash_path(ctx, spec.id).exists()
 }
 
 /// 配置文件里还有这个 Agent 的网关地址。
 pub fn points_at_gateway(ctx: &ApplyContext, spec: &AgentSpec) -> bool {
+    // 手动接入没有可读的配置，是否接入只看绑定。
+    if spec.manual.is_some() {
+        return false;
+    }
     let mut paths: Vec<PathBuf> = stash::load_stash::<AgentStash>(&stash_path(ctx, spec.id))
         .map(|agent_stash| agent_stash.files.into_keys().collect())
         .unwrap_or_default();

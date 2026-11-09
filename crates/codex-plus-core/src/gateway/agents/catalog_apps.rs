@@ -61,7 +61,7 @@ fn is_live(env: &AgentEnv) -> bool {
 }
 
 /// macOS 上装了某个 `.app`（`~/Applications` 或 `/Applications`）。
-fn mac_app(env: &AgentEnv, names: &[&str]) -> bool {
+pub(super) fn mac_app(env: &AgentEnv, names: &[&str]) -> bool {
     if env.os != Os::Mac {
         return false;
     }
@@ -417,6 +417,7 @@ pub const CLAUDE_DESKTOP: AgentSpec = AgentSpec {
     config_path: desktop_path,
     write: desktop_write,
     hint: "完全退出并重新打开 Claude Desktop 后生效（Code 与 Cowork 走网关，无需 Anthropic 登录）；非 Claude 模型在它的选择器里以真实名字显示（底层 id 是 claude-gw- / mythos-gw- 开头的别名），有思考档位的模型带思考等级菜单，选中的档位按模型实有档位套用",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Zed
@@ -482,6 +483,7 @@ pub const ZED: AgentSpec = AgentSpec {
     config_path: zed_path,
     write: zed_write,
     hint: "在 Zed 的 Agent 面板模型菜单里选 codexplus 下的模型；Zed 首次会要 API Key（存在系统钥匙串里），填这个 Agent 的网关 token",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- VS Code 系
@@ -784,6 +786,7 @@ pub const VSCODE: AgentSpec = AgentSpec {
     config_path: |env| vscode_user(env, &STABLE).join("chatLanguageModels.json"),
     write: |env, wiring, set| vscode_write(env, &STABLE, wiring, set),
     hint: "在 Chat 的模型选择器里选 codexplus 分组下的模型（需 VS Code 1.122+）；没出现时执行 Developer: Reload Window",
+    manual: None,
 };
 
 pub const VSCODE_INSIDERS: AgentSpec = AgentSpec {
@@ -795,6 +798,7 @@ pub const VSCODE_INSIDERS: AgentSpec = AgentSpec {
     config_path: |env| vscode_user(env, &INSIDERS).join("chatLanguageModels.json"),
     write: |env, wiring, set| vscode_write(env, &INSIDERS, wiring, set),
     hint: "在 Chat 的模型选择器里选 codexplus 分组下的模型；没出现时执行 Developer: Reload Window",
+    manual: None,
 };
 
 pub const VSCODIUM: AgentSpec = AgentSpec {
@@ -806,6 +810,7 @@ pub const VSCODIUM: AgentSpec = AgentSpec {
     config_path: |env| vscode_user(env, &CODIUM).join("chatLanguageModels.json"),
     write: |env, wiring, set| vscode_write(env, &CODIUM, wiring, set),
     hint: "需装 GitHub Copilot Chat 并开启 Chat 功能（chat.disableAIFeatures 设为 false）；Reload Window 后在 Chat 模型选择器选 codexplus 分组下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Zoo Code（VS Code 扩展）
@@ -882,6 +887,7 @@ pub const ZOO_CODE: AgentSpec = AgentSpec {
     config_path: zoo_import_path,
     write: zoo_write,
     hint: "在 VS Code 里执行 Developer: Reload Window，Zoo Code 启动时导入并切到 Codex++ 档案；断开后该档案仍留在 Zoo Code 里，需手动切走",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- JetBrains Air
@@ -939,6 +945,7 @@ pub const JETBRAINS_AIR: AgentSpec = AgentSpec {
     config_path: |env| air_dir(env).join("acp.json"),
     write: air_write,
     hint: "在 Air 新建任务时从 Agent 菜单选 Codex++，模型菜单里是网关的模型；需要本机装有 OpenCode",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Copilot (JetBrains)
@@ -1033,6 +1040,7 @@ pub const COPILOT_JETBRAINS: AgentSpec = AgentSpec {
     config_path: copilot_byok_path,
     write: copilot_write,
     hint: "重启 IDE 后在 Copilot Chat 的模型选择器里选 codexplus 下的模型；需要 Copilot 账号支持自带密钥（BYOK）",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Pencil
@@ -1082,6 +1090,7 @@ pub const PENCIL: AgentSpec = AgentSpec {
     config_path: pencil_path,
     write: pencil_write,
     hint: "重启 Pencil 后在 Agent 输入框的模型选择器里选 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- OpenPencil
@@ -1153,6 +1162,7 @@ pub const OPENPENCIL: AgentSpec = AgentSpec {
     config_path: openpencil_path,
     write: openpencil_write,
     hint: "接入和断开前先退出 OpenPencil（它退出时会写回设置）；打开后在对话的模型选择器里选 Codex++ 下的模型",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- Raycast
@@ -1335,6 +1345,7 @@ pub const RAYCAST: AgentSpec = AgentSpec {
     config_path: raycast_path,
     write: raycast_write,
     hint: "Raycast 会自动读取改动，在 AI Chat / Quick AI 的模型选择器里选 Codex++ 下的模型（需 Raycast Pro）",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- T3 Code
@@ -1430,6 +1441,7 @@ pub const T3_CODE: AgentSpec = AgentSpec {
     config_path: t3_path,
     write: t3_write,
     hint: "在 T3 Code 的模型选择器里选 Codex++ 供应商下的模型（由本机的 Claude Code 运行）",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- AstrBot
@@ -1536,6 +1548,7 @@ pub const ASTRBOT: AgentSpec = AgentSpec {
     config_path: astrbot_path,
     write: astrbot_write,
     hint: "重启 AstrBot 后生效，默认聊天模型切到 Codex++ 的主模型；重启前别在 WebUI 里保存设置（会整份写回）",
+    manual: None,
 };
 
 // ---------------------------------------------------------------- OpenClaw
@@ -1659,6 +1672,7 @@ pub const OPENCLAW: AgentSpec = AgentSpec {
     config_path: openclaw_path,
     write: openclaw_write,
     hint: "OpenClaw 会自动重新加载；已经选过模型的会话发 /model default 切到 Codex++ 的主模型",
+    manual: None,
 };
 
 #[cfg(test)]

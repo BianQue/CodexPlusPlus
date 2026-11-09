@@ -88,6 +88,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     config_path: opencode_path,
     write: |env, wiring, set| write_opencode_style(&opencode_path(env), wiring, set),
     hint: "在 OpenCode 里用 /models 选 Codex++ 下的模型",
+    manual: None,
 };
 
 #[cfg(test)]

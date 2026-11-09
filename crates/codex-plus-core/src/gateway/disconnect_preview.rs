@@ -204,6 +204,8 @@ pub fn preview(
         .cloned();
     if gateway.is_some() && binding.is_none() && !apply::agent_points_at_gateway(ctx, agent) {
         collect_agent_sources(ctx, agent, &mut sources)?;
+    } else if agents::is_manual(agent) {
+        // 手动接入：Codex++ 没改过它的任何文件，断开只是关掉绑定，没有要预览的文件。
     } else if let Some(spec) = agents::spec(agent.as_str()) {
         generic_preview(ctx, spec, &mut sources, &mut result)?;
     } else if matches!(agent, ToolId::Claude | ToolId::Grok | ToolId::Codex) {
@@ -257,7 +259,7 @@ fn collect_agent_sources(
             sources.read(&ctx.backup_root.join("codex-before-gateway.json"))?;
         }
         other => {
-            if let Some(spec) = agents::spec(other.as_str()) {
+            if let Some(spec) = agents::spec(other.as_str()).filter(|spec| spec.manual.is_none()) {
                 let path = agents::connect::stash_path(ctx, spec.id);
                 let saved = sources.read(&path)?;
                 sources.read(&(spec.config_path)(&ctx.agent_env))?;

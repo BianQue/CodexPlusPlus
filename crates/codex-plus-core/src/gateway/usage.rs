@@ -154,6 +154,19 @@ impl UsageStore {
         self.save(&UsageFile::default())
     }
 
+    /// 用量里出现过的 Agent（至少记过一次调用，失败的也算）。只扫按天汇总的计数，不碰请求内容。
+    /// 带错 Key（401）或开关关着（503）的请求在网关入口就被拒了，不会记进来。
+    pub fn seen_agents(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+        let file = self.load()?;
+        Ok(file
+            .days
+            .values()
+            .flatten()
+            .filter(|row| row.counts.calls > 0)
+            .map(|row| row.agent.clone())
+            .collect())
+    }
+
     /// 汇总 `days` 天（含今天；None 表示全部）的用量。`today` 是本地日期。
     pub fn summary(
         &self,
@@ -461,6 +474,25 @@ mod tests {
         assert_eq!(shift_day("2026-10-01", -1), "2026-09-30");
         assert_eq!(shift_day("2026-12-31", 1), "2027-01-01");
         assert_eq!(local_day(0).len(), 10);
+    }
+
+    #[test]
+    fn seen_agents_lists_each_agent_once_and_resets_on_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = UsageStore::at(temp.path().join("usage.json"));
+        assert!(store.seen_agents().unwrap().is_empty(), "文件不存在时为空");
+        record_entry_in(&store, &entry(Some("trae-cn"), "ds", 10, 5, 0)).unwrap();
+        record_entry_in(&store, &entry(Some("trae-cn"), "ds", 10, 5, 0)).unwrap();
+        let mut failed = entry(Some("claude"), "ds", 0, 0, 0);
+        failed.success = false;
+        failed.usage = None;
+        record_entry_in(&store, &failed).unwrap();
+        let seen = store.seen_agents().unwrap();
+        assert!(seen.contains("trae-cn"));
+        assert!(seen.contains("claude"), "失败的请求也说明请求到过网关");
+        assert_eq!(seen.len(), 2);
+        store.clear().unwrap();
+        assert!(store.seen_agents().unwrap().is_empty());
     }
 
     #[test]
