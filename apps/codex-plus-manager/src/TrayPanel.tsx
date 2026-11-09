@@ -39,6 +39,7 @@ import {
 import { t, tf } from "./i18n";
 import { ModelList, Floating, ownCurrent } from "./GatewayAgents";
 import { AgentDisconnectDialog } from "./AgentDisconnectDialog";
+import { manualPresentation } from "./gateway-agent-safety";
 import {
   glanceAgents,
   agentModels,
@@ -773,7 +774,9 @@ function GatewayTab({
       <Section title={solo ? tf("{0} 用的模型", [agentName(solo)]) : t("各 Agent 用的模型")}>
         <div className="tp-card tp-list">
           {visibleAgents(focus, glanceAgents(payload?.agents)).map((agent) => (
-            <PanelAgentRow agent={agent} key={agent.agent} onRun={run} payload={payload} />
+            agent.manual
+              ? <PanelManualAgentRow agent={agent} helperRunning={Boolean(payload?.helperRunning)} key={agent.agent} />
+              : <PanelAgentRow agent={agent} key={agent.agent} onRun={run} payload={payload} />
           ))}
         </div>
         {message ? <p className="tp-error">{message}</p> : null}
@@ -881,6 +884,18 @@ function FlowTab({ today, payload, onOpenRoute }: { today: UsageSummary | null; 
         </div>
       </Section>
     </>
+  );
+}
+
+/** 手动接入的 Agent（Trae CN 等）：模型在它自己的界面里选，这里只显示状态，到主窗口看接入指引。 */
+function PanelManualAgentRow({ agent, helperRunning }: { agent: GatewayAgentView; helperRunning: boolean }) {
+  const presentation = manualPresentation(agent, helperRunning);
+  return (
+    <div className="tp-agent">
+      <AgentIcon agent={agent.agent} className="gw-agent-icon" />
+      <strong>{agent.name}</strong>
+      <span className="gw-agent-badge tp-agent-status" data-tone={presentation.tone}>{t(presentation.badge)}</span>
+    </div>
   );
 }
 

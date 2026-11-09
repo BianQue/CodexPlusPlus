@@ -5,7 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Copy, FolderOpen, List, Search, Shuffle, Star, Waypoints, X } from "lucide-react";
 import { t, tf } from "./i18n";
 import { AgentDisconnectDialog } from "./AgentDisconnectDialog";
-import { agentDiagnosticPresentation, canReconnectAgent, diagnosticErrorLabel, diagnosticEvidenceLabel } from "./gateway-agent-safety";
+import { agentDiagnosticPresentation, agentPresentation, canReconnectAgent, diagnosticErrorLabel, diagnosticEvidenceLabel } from "./gateway-agent-safety";
+import { ManualGuideDialog } from "./GatewayManualGuide";
 import {
   agentModels,
   agentPoolProviders,
@@ -187,6 +188,9 @@ function AgentRow({
     return run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(next, binding) }, t("保存网关绑定"), connected);
   };
   const disconnect = () => setDisconnectTarget("disconnect");
+  // 手动接入（Trae CN 等）：没有模型下拉和断开预览，行里是「接入指引」。
+  const manual = agent.manual ?? null;
+  const [guideOpen, setGuideOpen] = useState(false);
   // 在选择器里选模型：已接入时直接改默认模型，未接入时选完即接入。
   const pick = (item: PickerItem) => {
     setPickerOpen(false);
@@ -202,8 +206,18 @@ function AgentRow({
     await run(`own:${agent.agent}`, "use_gateway_own_model", { agent: agent.agent, model: item.model }, t("切换模型"));
   };
   const toggle = () => {
+    if (connected && manual) {
+      // 没有文件要还原：直接关掉绑定（token 保留），后端对手动接入免预览。
+      void run(`disable:${agent.agent}`, "disable_gateway_binding", { agent: agent.agent }, t("暂停接入"));
+      return;
+    }
     if (connected) {
       void disconnect();
+      return;
+    }
+    if (manual) {
+      // 首次打开就把指引弹出来：接下来要去 Trae 里照着填。
+      void save(draft).then((ok) => { if (ok) setGuideOpen(true); });
       return;
     }
     const error = validateDraft(draft, payload);
@@ -217,7 +231,7 @@ function AgentRow({
 
   const running = Boolean(payload?.helperRunning);
   const drift = connected ? agent.drift ?? null : null;
-  const diagnostic = agentDiagnosticPresentation(agent, running);
+  const diagnostic = agentPresentation(agent, running);
   const modelCount = agentModels(payload, draft.poolExclude).length;
   const reconnectAllowed = canReconnectAgent(agent, payload?.relayProfilesEnabled);
   const reconnect = () =>
@@ -254,7 +268,7 @@ function AgentRow({
             <span className="cx-row-detail gw-agent-meta" title={drift?.endpoint ? tf("现在连的是 {0}", [drift.endpoint]) : undefined}>
               {/* 「等待请求验证」读起来像出了问题：还没见到请求只是还没用过，写「还没收到请求」。 */}
               <span className="gw-agent-badge" data-tone={diagnostic.tone}>{agentStatusText(agent, diagnostic.badge, diagnostic.tone)}</span>
-              {connected && !diagnostic.reconnect ? <span>{tf("{0} 个模型", [modelCount])}</span> : null}
+              {manual ? <span>{tf("{0} 个模型可添加", [manual.models.length])}</span> : connected && !diagnostic.reconnect ? <span>{tf("{0} 个模型", [modelCount])}</span> : null}
               {note ? <span>{note}</span> : null}
               {diagnostic.reconnect ? (
                 reconnectAllowed ? (
@@ -276,6 +290,11 @@ function AgentRow({
           </span>
         </div>
         <div className="cx-row-controls">
+          {manual ? (
+            <button className="gw-picker-button gw-manual-guide-button" onClick={() => setGuideOpen(true)} type="button">
+              {t("接入指引")}
+            </button>
+          ) : (
           <ModelPicker
             agent={agent}
             connected={connected}
@@ -290,6 +309,7 @@ function AgentRow({
             open={pickerOpen}
             payload={payload}
           />
+          )}
           <Switch disabled={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
           <button
             aria-expanded={expanded}
@@ -306,6 +326,9 @@ function AgentRow({
       </div>
       {expanded && connected ? (
         <AgentDetail agent={agent} busy={busy} draft={draft} onDisconnect={() => void disconnect()} onManage={onManage} onSave={(next) => void save(next)} payload={payload} run={run} />
+      ) : null}
+      {guideOpen && manual ? (
+        <ManualGuideDialog agent={agent} busy={busy} onClose={() => setGuideOpen(false)} payload={payload} run={run} />
       ) : null}
       {disconnectTarget ? (
         <AgentDisconnectDialog
@@ -385,7 +408,7 @@ function AgentDetail({
     <div className="gw-agent-detail">
       {/* 接入诊断只在出问题时出现（配置被改、读不到、网关没运行、上游报错），并自动展开详情；
           正常时 Agent 名字下面那行状态就够了，不单独占一行。 */}
-      {agentDiagnosticPresentation(agent, Boolean(payload?.helperRunning)).tone === "error" ? (
+      {agentPresentation(agent, Boolean(payload?.helperRunning)).tone === "error" || (agent.manual && agent.diagnostics?.state === "upstreamError") ? (
         <AgentDiagnostics agent={agent} helperRunning={Boolean(payload?.helperRunning)} />
       ) : null}
       {agent.hint ? (
@@ -513,7 +536,8 @@ function AgentDetail({
             value={draft.unknownModel}
           />
         </SetLine>
-        {/* 窗口按模型在供应商池里填；这里只给池里没写窗口的模型兜底。 */}
+        {/* 窗口按模型在供应商池里填；这里只给池里没写窗口的模型兜底。手动接入不写配置，这个值用不上。 */}
+        {agent.manual ? null : (
         <SetLine hint={t("供应商池里没写窗口的模型用这个")} title={t("默认窗口")} tooltip={t("供应商池里没写窗口的模型用这个；按模型的窗口在供应商池的详情里填")}>
           <input
             aria-label={t("默认窗口")}
@@ -527,6 +551,7 @@ function AgentDetail({
             value={windowText}
           />
         </SetLine>
+        )}
         {isClaude ? (
           <SetLine hint={t("非 claude-* 模型名时也照常发送 effort")} title={t("强制启用推理强度")} tooltip={t("非 claude-* 模型名时 Claude Code 默认不发 effort，打开后照常发送。")}>
             <Switch disabled={busy !== null} label={t("强制启用推理强度")} on={draft.claudeEnableEffort} onToggle={() => onSave({ ...draft, claudeEnableEffort: !draft.claudeEnableEffort })} />
@@ -536,6 +561,8 @@ function AgentDetail({
           <Switch disabled={busy !== null} label={t("添加供应商时自动加入")} on={draft.autoJoinProviders} onToggle={() => onSave({ ...draft, autoJoinProviders: !draft.autoJoinProviders })} />
         </SetLine>
       </details>
+      {/* 手动接入没有改动的配置文件，断开就是行里的开关。 */}
+      {agent.manual ? null : (
       <div className="gw-detail-row gw-detail-foot">
         <span className="gw-detail-label gw-detail-file" title={agent.configPath ?? ""}>
           {t("改动了")} <code>{agent.configPath ?? ""}</code>
@@ -547,6 +574,7 @@ function AgentDetail({
           <button className="gw-danger-link" disabled={busy !== null} onClick={onDisconnect} type="button">{t("断开并还原")}</button>
         </div>
       </div>
+      )}
     </div>
   );
 }
@@ -556,6 +584,8 @@ function AgentDetail({
  * 还没见到请求写「还没收到请求」（原来的「等待请求验证」读起来像出了问题）；出问题时照旧写原因。
  */
 function agentStatusText(agent: GatewayAgentView, badge: string, tone: string): string {
+  // 手动接入的三种状态（未接入 / 等待首个请求 / 已接入）文字固定，不改写成「最近请求…」。
+  if (agent.manual) return t(badge);
   const lastSeen = agent.diagnostics?.lastSeenMs;
   if (tone === "on" && lastSeen) {
     const when = relativeTime(lastSeen, Date.now());
@@ -581,6 +611,7 @@ function SetLine({ title, hint, tooltip, className = "", children }: { title: Re
 /** 接入状态一行：请求数、最近请求；地址、配置证据、最近错误收进「诊断详情」，有错误时默认展开。 */
 function AgentDiagnostics({ agent, helperRunning }: { agent: GatewayAgentView; helperRunning: boolean }) {
   const diagnostics = agent.diagnostics;
+  // 诊断详情照实显示配置与流量的联合诊断（手动接入也只在上游失败时才展开到这里）。
   const presentation = agentDiagnosticPresentation(agent, helperRunning);
   const lastSeen = diagnostics?.lastSeenMs
     ? new Date(diagnostics.lastSeenMs).toLocaleString()

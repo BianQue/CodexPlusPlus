@@ -98,6 +98,7 @@ const AGENT_BRANDS: Record<string, string> = {
   vscodium: "vscodium",
   "jetbrains-air": "jetbrains",
   raycast: "raycast",
+  "trae-cn": "trae-color",
 };
 for (const [agent, key] of Object.entries(AGENT_BRANDS)) {
   if (!AGENT_ICONS[agent] && BRAND_ICON_URLS[key]) AGENT_ICONS[agent] = BRAND_ICON_URLS[key];

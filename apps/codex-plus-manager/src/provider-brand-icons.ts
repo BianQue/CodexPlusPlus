@@ -50,6 +50,7 @@ export const BRAND_ICON_URLS: Record<string, string> = {
   "stepfun-color": new URL("./assets/providers/stepfun-color.svg", import.meta.url).href,
   "tencentcloud-color": new URL("./assets/providers/tencentcloud-color.svg", import.meta.url).href,
   "together-color": new URL("./assets/providers/together-color.svg", import.meta.url).href,
+  "trae-color": new URL("./assets/providers/trae-color.svg", import.meta.url).href,
   "vertexai-color": new URL("./assets/providers/vertexai-color.svg", import.meta.url).href,
   "volcengine-color": new URL("./assets/providers/volcengine-color.svg", import.meta.url).href,
   "vscodium": new URL("./assets/providers/vscodium.svg", import.meta.url).href,

@@ -888,3 +888,21 @@ body:has(.tray-panel) {
   border-radius: 4px;
   font-size: 8.5px;
 }
+
+/* 手动接入的 Agent 只显示状态（模型在它自己的界面里选）。 */
+.tray-panel .tp-agent .tp-agent-status {
+  justify-self: end;
+  padding: 0 7px;
+  border: 1px solid var(--gw-line, hsl(var(--border)));
+  border-radius: 5px;
+  font-size: 11.5px;
+  line-height: 18px;
+}
+
+.tray-panel .tp-agent .tp-agent-status[data-tone="on"] {
+  color: hsl(var(--status-success, 142 60% 45%));
+}
+
+.tray-panel .tp-agent .tp-agent-status[data-tone="error"] {
+  color: hsl(var(--status-error));
+}

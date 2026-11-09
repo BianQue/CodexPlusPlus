@@ -221,7 +221,33 @@ export type GatewayAgentView = {
   diagnostics?: GatewayAgentDiagnostics | null;
   /** Agent 自带的模型：用它自己的登录或 Key 直连厂商，不经 Codex++；选中即断开网关。 */
   ownModels?: OwnModels | null;
+  /** 手动接入（如 Trae CN）：接入指引；有它时行里不放模型下拉，也不显示改动的配置文件。旧版后端没有。 */
+  manual?: ManualGuide | null;
 };
+
+export type ManualWire = "chat" | "responses" | "anthropic" | "gemini";
+/** 手动接入的接入指引：地址、模型都由后端按当前端口和供应商池算好，API Key 从绑定里读。 */
+export type ManualGuide = {
+  menuPath: string;
+  notes: string[];
+  endpoints: Array<{ wire: ManualWire; baseUrl: string }>;
+  models: Array<{ id: string; displayName: string }>;
+  /** 用量里见过这个 Agent 的请求。 */
+  seen: boolean;
+};
+
+/** 指引里每种格式的名字，用 Trae「API 格式」下拉里的叫法。 */
+export const MANUAL_WIRE_LABELS: Record<ManualWire, string> = {
+  chat: "OpenAI Chat Completions",
+  responses: "OpenAI Responses",
+  anthropic: "Anthropic Messages",
+  gemini: "Gemini",
+};
+
+/** 打码显示：头 10 位 + … + 尾 4 位，复制时给原文。 */
+export function maskApiKey(token: string): string {
+  return token.length > 16 ? `${token.slice(0, 10)}…${token.slice(-4)}` : token;
+}
 
 export type OwnModel = { id: string; label: string };
 /** `vendor`：直连的对象（OpenAI、Anthropic、直连模式的供应商名）；`current`：没接入时 Agent 现在用的模型。 */

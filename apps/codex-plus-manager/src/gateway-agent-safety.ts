@@ -27,6 +27,19 @@ export function agentDiagnosticPresentation(agent: GatewayAgentView, helperRunni
   return { badge: "等待请求验证", tone: "pending", reconnect: false };
 }
 
+/** 手动接入的状态：只看开关和用量，不看配置文件（Codex++ 没有改它的文件）。上游失败另行提示，不覆盖徽标。 */
+export function manualPresentation(agent: GatewayAgentView, helperRunning: boolean): AgentDiagnosticPresentation {
+  if (!agent.enabled) return { badge: "未接入", tone: "off", reconnect: false };
+  if (!helperRunning || agent.diagnostics?.state === "gatewayStopped") return { badge: "网关未运行", tone: "error", reconnect: false };
+  if (agent.manual?.seen) return { badge: "已接入", tone: "on", reconnect: false };
+  return { badge: "等待首个请求", tone: "pending", reconnect: false };
+}
+
+/** 行和详情共用：手动接入走 {@link manualPresentation}，其它走配置与流量的联合诊断。 */
+export function agentPresentation(agent: GatewayAgentView, helperRunning: boolean): AgentDiagnosticPresentation {
+  return agent.manual ? manualPresentation(agent, helperRunning) : agentDiagnosticPresentation(agent, helperRunning);
+}
+
 export function disconnectPreviewReady(preview: GatewayDisconnectPreview | null, agent: string): preview is GatewayDisconnectPreview {
   return Boolean(preview?.canDisconnect && preview.agent === agent && preview.previewToken.trim());
 }

@@ -301,6 +301,7 @@ const gateway = ok({
     bindings: {
       codex: gatewayBinding("group/coding"),
       claude: gatewayBinding("deepseek-v4-pro", { claudeRoles: { opus: "chatgpt-pro/gpt-5.5", sonnet: "deepseek-v4-pro", haiku: "deepseek-v4-flash", subagent: "" } }),
+      "trae-cn": gatewayBinding("", { token: "cpx-gw-trae-cn-demo00000000000000000000000000" }),
     },
     keyPolicy: { mode: "sticky" },
     restoreOnExit: true,
@@ -330,6 +331,21 @@ const gateway = ok({
     { agent: "codex", name: "Codex", version: "26.1029", enabled: true, baseUrl: "http://127.0.0.1:63130/codex", defaultModel: "group/coding", models: [] },
     { agent: "claude", name: "Claude Code", version: "2.4.0", enabled: true, baseUrl: "http://127.0.0.1:63130/claude", defaultModel: "deepseek-v4-pro", models: [] },
     { agent: "grok", name: "Grok", enabled: false, baseUrl: "http://127.0.0.1:63130/grok", defaultModel: "", models: [] },
+    // 手动接入：没有模型下拉，行里是「接入指引」。
+    {
+      agent: "trae-cn", name: "Trae CN", enabled: true, baseUrl: "http://127.0.0.1:63130/gw/trae-cn", defaultModel: "deepseek-v4-pro", models: [],
+      manual: {
+        menuPath: "AI 设置 → 模型 → 添加模型 → 自定义",
+        notes: ["「完整 URL」保持关闭：Trae 会在地址后自动拼上 /chat/completions、/responses 或 /v1/messages", "模型 ID 要与下方列表一字不差；发一条消息后状态变为「已接入」"],
+        endpoints: [
+          { wire: "chat", baseUrl: "http://127.0.0.1:63130/gw/trae-cn/v1" },
+          { wire: "responses", baseUrl: "http://127.0.0.1:63130/gw/trae-cn/v1" },
+          { wire: "anthropic", baseUrl: "http://127.0.0.1:63130/gw/trae-cn" },
+        ],
+        models: [{ id: "deepseek-v4-pro", displayName: "deepseek-v4-pro" }, { id: "gpt-5.5", displayName: "gpt-5.5" }, { id: "group/coding", displayName: L("主力编程", "Main coding") }],
+        seen: false,
+      },
+    },
   ],
   health: { keys: [{ relayId: "zhipu", keyId: "k1", state: "cooling", remainingMs: 42000 }], providers: [] },
   speeds: [

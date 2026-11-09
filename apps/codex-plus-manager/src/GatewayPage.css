@@ -4360,3 +4360,71 @@ body:has(.gw-modal-backdrop) .app-select-menu-portal {
 .gw-portal .gw-disconnect-confirm:hover {
   background: color-mix(in srgb, var(--gw-err) 88%, black);
 }
+
+/* 手动接入（Trae CN 等）的接入指引弹窗：地址、Key、模型逐行可复制。 */
+.gw-modal.gw-manual-guide {
+  width: min(640px, 100%);
+}
+
+.gw-manual-guide .gw-manual-path,
+.gw-manual-guide .gw-manual-off,
+.gw-manual-guide .gw-manual-hint {
+  margin: 0;
+  color: var(--gw-mute);
+  font-size: 12.5px;
+}
+
+.gw-manual-guide .gw-manual-section {
+  display: grid;
+  gap: 6px;
+}
+
+.gw-manual-guide .gw-manual-section h4 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.gw-manual-guide .gw-manual-line {
+  display: grid;
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 2px 8px;
+  border: 1px solid var(--gw-line);
+  border-radius: 8px;
+}
+
+.gw-manual-guide .gw-manual-line code {
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.gw-manual-guide .gw-manual-models .gw-manual-line {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.gw-manual-guide .gw-manual-models {
+  display: grid;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.gw-manual-guide .gw-manual-line small {
+  color: var(--gw-mute);
+}
+
+.gw-manual-guide .gw-manual-notes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--gw-mute);
+  font-size: 12px;
+  line-height: 1.6;
+}

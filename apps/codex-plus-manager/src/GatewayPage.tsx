@@ -55,6 +55,7 @@ import "./GatewayPage.css";
 import { CxBadge, CxCard, CxRow, CxSection } from "./cx-layout";
 import { Menu, MenuItem } from "./ManagementPages";
 import { AgentGlyph } from "./HubOverview";
+import { confirmRegenerate } from "./GatewayManualGuide";
 
 type Tab = "agents" | "sessions" | "providers" | "routing" | "usage" | "gateway";
 export type GatewayTab = Tab;
@@ -773,19 +774,25 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
           </CxRow>
           {visibleAgents(agentFocus, glanceAgents(payload.agents)).map((agent) => {
             const binding = payload.gateway.bindings[agent.agent];
+            // 手动接入：OpenAI 格式要带 /v1，显示指引里的第一个地址（根地址对它是错的）。
+            const address = agent.manual?.endpoints[0]?.baseUrl ?? agent.baseUrl;
             return (
               <CxRow
                 badges={agent.enabled ? null : <CxBadge>{t("未接入")}</CxBadge>}
-                detail={<code className="cx-set-path" title={agent.baseUrl}>{agent.baseUrl}</code>}
+                detail={<code className="cx-set-path" title={address}>{address}</code>}
                 icon={<AgentGlyph agent={agent.agent} />}
                 key={agent.agent}
                 title={agent.name}
-                tooltip={agent.enabled ? t("已写入该 Agent 的配置") : t("开启后写入该 Agent 的配置")}
+                tooltip={agent.manual ? tf("在 {0} 里手动填写，Codex++ 不改它的配置", [agent.name]) : agent.enabled ? t("已写入该 Agent 的配置") : t("开启后写入该 Agent 的配置")}
               >
-                {copyButton(agent.agent, agent.baseUrl)}
+                {copyButton(agent.agent, address)}
                 {binding?.token ? (
                   <Menu>
-                    <MenuItem disabled={busy !== null} onClick={() => void run(`rotate:${agent.agent}`, "rotate_gateway_token", { agent: agent.agent }, t("更换 token"))}>
+                    <MenuItem disabled={busy !== null} onClick={() => void (async () => {
+                      // 手动接入的 Key 是用户自己填进应用的：换之前先确认。
+                      if (agent.manual && !(await confirmRegenerate(agent.name))) return;
+                      await run(`rotate:${agent.agent}`, "rotate_gateway_token", { agent: agent.agent }, t("更换 token"));
+                    })()}>
                       {t("更换 token")}
                     </MenuItem>
                   </Menu>

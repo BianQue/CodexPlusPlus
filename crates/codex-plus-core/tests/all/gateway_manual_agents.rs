@@ -317,3 +317,13 @@ fn disconnect_preview_reads_nothing_and_allows_disconnect() {
     assert_eq!(preview.warnings.len(), 1, "{:?}", preview.warnings);
     assert!(preview.warnings[0].contains("没有改动"), "不能出现「配置文件原文差异」这类提示");
 }
+
+#[test]
+fn switching_on_without_a_model_uses_the_pool_default() {
+    // 手动接入的行里没有模型下拉，界面打开开关时传的是空模型：要能接入，默认模型取池里的。
+    let fixture = fixture();
+    let gateway = enable_binding(&fixture.ctx, &agent(), AgentBinding::default()).unwrap();
+    assert!(gateway.active_binding(&agent()).is_some());
+    let wired = agents::connect::wiring(&gateway, &gateway.bindings[ID], ID, fixture.ctx.port);
+    assert!(!wired.default_model.is_empty());
+}

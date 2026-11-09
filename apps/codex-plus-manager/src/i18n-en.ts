@@ -3475,6 +3475,23 @@ export const EN_PLAIN: Record<string, string> = {
   "Grok 仍连接网关，但没有可用的恢复存档，当前供应商也没有模型；请在 Grok 供应商页添加并应用一个直连供应商后再断开。": "Grok still points to the gateway, but no usable restoration archive or direct-provider models are available. Add and apply a direct provider on the Grok providers page before disconnecting.",
     "隔离预演未能完成还原；原配置未被修改，请检查可切回的供应商和恢复存档。": "The isolated restoration simulation did not complete. The original configuration was not changed. Check the available direct providers and restoration archive.",
   "Codex 配置按实时恢复存档计算；正式断开仍需成功切换直连供应商，并更新模型目录、应用状态和备份。供应商校验或写入失败时会中止断开。": "The Codex configuration is calculated from the live restoration archive. Disconnecting still requires switching to the direct provider and updating model catalogs, application state and backups. The disconnect is aborted if provider validation or writing fails.",
+  "接入指引": "Setup guide",
+  "暂停接入": "Pause connection",
+  "等待首个请求": "Waiting for first request",
+  "重新生成 API Key？": "Regenerate API key?",
+  "重新生成 API Key": "Regenerate API key",
+  "API 格式与请求地址": "API format and base URL",
+  "API 密钥": "API key",
+  "复制 API Key": "Copy API key",
+  "复制模型 ID": "Copy model ID",
+  "复制全部模型 ID": "Copy all model IDs",
+  "打开右侧开关后生成 API Key": "Turn on the switch to create an API key",
+  "供应商池里还没有模型，先去添加供应商。": "The provider pool has no models yet. Add a provider first.",
+  "开关关着时网关会拒绝它的请求（503）；API Key 保留，打开后即可继续用。": "While the switch is off, the gateway rejects its requests (503). The API key is kept and works again once you turn it back on.",
+  "AI 设置 → 模型 → 添加模型 → 自定义": "AI Settings → Models → Add Model → Custom",
+  "「完整 URL」保持关闭：Trae 会在地址后自动拼上 /chat/completions、/responses 或 /v1/messages": "Keep \"Full URL\" off: Trae appends /chat/completions, /responses or /v1/messages to the base URL",
+  "模型 ID 要与下方列表一字不差；发一条消息后状态变为「已接入」": "Model IDs must match the list below exactly. The status turns to \"Connected\" after you send a message",
+  "用于 Chat 与 Agent / Builder 模式；Trae 的代码补全不走自定义模型": "Used for Chat and Agent / Builder modes. Trae's code completion does not use custom models",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
@@ -4114,6 +4131,12 @@ export const EN_TEMPLATE: Record<string, string> = {
   "请求 {0} · 失败 {1} · 进行中 {2}": "Requests {0} · Failed {1} · In progress {2}",
   "最近请求：{0}": "Last request: {0}",
   "最近一次网关错误：{0}": "Last gateway error: {0}",
+  "{0} 接入指引": "{0} setup guide",
+  "在 {0} 里打开：{1}": "In {0}, open: {1}",
+  "模型 ID（{0}）": "Model IDs ({0})",
+  "{0} 个模型可添加": "{0} models to add",
+  "在 {0} 里手动填写，Codex++ 不改它的配置": "Filled in by hand in {0}; Codex++ does not change its config",
+  "旧 Key 会立即失效。之后要在 {0} 里把每个自定义模型的 API Key 都换成新的，否则请求会被拒绝（401）。": "The old key stops working right away. Replace the API key of every custom model in {0}, or its requests are rejected (401).",
 };
 
 // Backend (Rust) messages returned via result.message. These are translated
@@ -4270,6 +4293,7 @@ export const EN_BACKEND: Record<string, string> = {
   // 从上游同步上下文窗口 / 思考等级（#2807）
   "这类供应商的模型接口不提供上下文窗口和思考等级，请手动填写": "This provider's model endpoint does not report context windows or reasoning levels; fill them in manually",
   "模型资料不是有效的 JSON，请先在「思考等级」里修正": "The model metadata is not valid JSON; fix it under Reasoning levels first",
+  "Codex++ 没有改动这个 Agent 的任何文件；断开后网关对它的请求返回 503，API Key 保留，重新打开即可继续用。": "Codex++ did not change any file of this agent. After disconnecting, the gateway answers its requests with 503. The API key is kept and works again once you reconnect.",
 };
 
 // Pattern-based backend translations: [regex, replacement template].
@@ -4387,4 +4411,8 @@ export const EN_BACKEND_PATTERNS: Array<[RegExp, string]> = [
   [/^删除 Key 失败：(.+)$/, "Failed to delete key: $1"],
   // 供应商池：测试供应商
   [/^测试失败：(.+)$/, "Test failed: $1"],
+  [/^(.+?) 已暂停接入：网关对它的请求返回 503，API Key 保留，重新打开即可继续用。$/, "$1 is paused: the gateway answers its requests with 503. The API key is kept and works again once you turn it back on."],
+  [/^(.+?) 已开启接入，按「接入指引」在 (.+?) 里添加模型。$/, "$1 is connected. Follow the setup guide to add models in $2."],
+  [/^已更换网关 token。请到 (.+?) 里把每个自定义模型的 API Key 换成新的。$/, "Gateway token changed. Replace the API key of every custom model in $1."],
+  [/^(.+?) 由用户在应用里手动配置，Codex\+\+ 没有改动它的文件$/, "$1 is configured by hand in the app; Codex++ did not change its files"],
 ];
