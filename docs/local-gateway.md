@@ -49,6 +49,21 @@ Codex / Claude Code / Grok 之外的 Agent 由规格表接入（`gateway/agents/
 配置里找不到 `/gw/<id>` 时算被别的工具改掉。网关对通用 Agent 同时接受 Chat Completions、Responses、
 Anthropic Messages 与 Gemini（`/v1beta/models/<模型>:streamGenerateContent`，Key 可放 `x-goog-api-key` 或 `?key=`）。
 
+配置存在云端账号里、本地没有可写文件的应用走**手动接入**（`catalog_manual.rs`，规格带 `manual`），目前是 Trae CN
+（自定义模型存在 Trae 账号里，本地 `state.vscdb` 只是缓存）。Codex++ 不写、不读它的任何文件，也不做漂移检测，
+只签发 token、路由请求、记用量；用户照「接入指引」在 Trae 的「AI 设置 → 模型 → 添加模型 → 自定义」里逐个添加模型：
+
+- 地址：OpenAI Chat Completions 与 Responses 填 `http://127.0.0.1:<端口>/gw/trae-cn/v1`，Anthropic Messages 填
+  `http://127.0.0.1:<端口>/gw/trae-cn`（Trae 自己拼 `/v1/messages`），Trae 的「完整 URL」保持关闭。
+- 模型 ID 是池里全部模型，与写配置的 Agent 用同一份（裸名，有冲突时才带 `<供应商>/`，模型组是 `group/<id>`）。
+- API Key 是这个 Agent 的网关 token：第一次打开开关时签发，之后关掉再开都沿用；关着时网关对它回 503。
+  只有「重新生成」会换，换完要回 Trae 把每个模型的 Key 改掉。
+- 状态只看开关和用量：开着且 `gateway-usage.json` 里有它的请求为「已接入」，否则「等待首个请求」
+  （带错 Key 或开关关着的请求在入口就被拒，不记用量；清空用量后回到「等待首个请求」）。
+- 网关端口变了不会改 Trae 里填的地址，要回 Trae 更新；卡片里的地址总按当前端口显示。
+- 安装探测只看安装位置：Windows `%LOCALAPPDATA%\Programs\Trae CN\Trae CN.exe`，macOS `/Applications` 或
+  `~/Applications` 下的 `Trae CN.app`。以后加 Trae 国际版、TRAE SOLO CN 只在 `catalog_manual.rs` 加规格。
+
 只能用环境变量、数据库或运行中的本地 API 配置的应用（Claude Science、Cursor Private Inference、NewMax、
 OpenHanako、Alma、Cindy、AionUi、Lody），以及不支持自定义地址的（Cursor CLI、Devin CLI）没有接入。
 
@@ -99,6 +114,7 @@ Agent 打开「接入」后，池里所有打开的供应商的模型和所有�
 「本地网关」页分四个标签：
 
 - **智能体**：已接入的 Agent 在上，「未设置」的在下。每行：图标、名字和本机 CLI 版本、状态、档位 / 模型入口、模型下拉、接入开关。
+  手动接入的 Agent（Trae CN）没有模型下拉，换成「接入指引」按钮；详情里也没有「改动了 <文件>」和「默认窗口」。
   模型下拉顶部是「默认（不经 Codex++）」和「断开 Codex++（还原配置）」，左侧可切到全部 / 收藏 / 某个供应商；
   未接入时选一个模型即接入。池里的模型之后是一组 Agent 自带的模型，标「直连，不经 Codex++」（`gateway/own_models.rs`）：
   Codex 列断开后会回到的直连供应商的模型（官方登录读 `models_cache.json`，记为 OpenAI；聚合供应商列它发布给 Codex 的模型目录；别的供应商读它的模型列表），
