@@ -144,6 +144,8 @@
   min-width: 200px;
   max-width: 100%;
   flex: 0 1 auto;
+  /* 内容不满 200px（手动接入行只有「接入指引」）时靠右，开关与其它行对齐。 */
+  justify-content: flex-end;
   gap: 10px;
   margin-left: auto;
 }
