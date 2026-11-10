@@ -243,7 +243,9 @@ export function HubOverview({
 function AgentNode({ agent, onOpen }: { agent: ReturnType<typeof hubAgents>[number]; onOpen: () => void }) {
   const detail = agent.direct
     ? (agent.detail ? tf("直连 · {0}", [agent.detail]) : t("直连模式"))
-    : agent.enabled ? agent.detail || t("已接入") : t("未接入网关");
+    : !agent.enabled ? t("未接入网关")
+      : agent.manualModels !== undefined ? tf("手动接入 · {0} 个模型", [agent.manualModels])
+        : agent.detail || t("已接入");
   return (
     <button className="hub-node" data-node={`agent:${agent.id}`} data-off={!agent.enabled && !agent.direct} onClick={onOpen} title={`${agent.name} · ${detail}`} type="button">
       <span className="hub-node-icon"><AgentGlyph agent={agent.id} /></span>

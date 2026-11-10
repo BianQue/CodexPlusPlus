@@ -99,7 +99,9 @@ export function AgentDashboard({
   const view = payload?.agents.find((item) => item.agent === agent);
   const access = agentAccessState(view);
   const binding = payload?.gateway.bindings[agent];
-  const model = view?.enabled && binding ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";
+  // 手动接入的 Agent 用哪个模型由用户在 Agent 里选，默认模型对它没有意义。
+  const model = view?.manual ? tf("手动接入 · {0} 个模型", [view.manual.models.length])
+    : view?.enabled && binding ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";
   const usageStats = agentUsageStats(usage, agent);
 
   const launch = async () => {

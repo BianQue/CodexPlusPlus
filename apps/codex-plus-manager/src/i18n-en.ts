@@ -4135,6 +4135,7 @@ export const EN_TEMPLATE: Record<string, string> = {
   "在 {0} 里打开：{1}": "In {0}, open: {1}",
   "模型 ID（{0}）": "Model IDs ({0})",
   "{0} 个模型可添加": "{0} models to add",
+  "手动接入 · {0} 个模型": "Manual setup · {0} models",
   "在 {0} 里手动填写，Codex++ 不改它的配置": "Filled in by hand in {0}; Codex++ does not change its config",
   "旧 Key 会立即失效。之后要在 {0} 里把每个自定义模型的 API Key 都换成新的，否则请求会被拒绝（401）。": "The old key stops working right away. Replace the API key of every custom model in {0}, or its requests are rejected (401).",
 };

@@ -139,3 +139,18 @@ test("最近请求里能展开路由经过的：每个 Agent 最近一次结束�
   assert.equal(routeRecordsByEntry(data, [row("stale", record.finishedAtMs - 60_000)]).size, 0);
   assert.equal(routeRecordsByEntry(null, [row("x", 1)]).size, 0);
 });
+
+test("手动接入的 Agent 不显示默认模型，只给可添加的模型数", () => {
+  const base = payload();
+  const guide = { menuPath: "", notes: [], endpoints: [], models: [{ id: "a", displayName: "A" }, { id: "b", displayName: "B" }], seen: true };
+  const trae = { agent: "trae-cn", name: "Trae CN", enabled: true, baseUrl: "", defaultModel: "deepseek-v4-pro", models: [], manual: guide } as (typeof base.agents)[number];
+  const data = {
+    ...base,
+    gateway: { ...base.gateway, bindings: { ...base.gateway.bindings, "trae-cn": { ...base.gateway.bindings.claude } } },
+    agents: [...base.agents, trae],
+  } as GatewayPayload;
+  const node = hubAgents(data, { running: true, providerName: null }).find((agent) => agent.id === "trae-cn");
+  assert.equal(node?.detail, "");
+  assert.equal(node?.manualModels, 2);
+  assert.equal(hubAgents(data, { running: true, providerName: null }).find((agent) => agent.id === "claude")?.manualModels, undefined);
+});

@@ -21,6 +21,8 @@ export type HubAgentNode = {
   direct: boolean;
   /** 副标题：网关模型，或直连的供应商名。 */
   detail: string;
+  /** 手动接入的 Agent 可添加的模型数：模型由用户在 Agent 里选，不显示默认模型。 */
+  manualModels?: number;
   requests: number;
   live: boolean;
 };
@@ -60,13 +62,14 @@ export function hubAgents(payload: GatewayPayload | null, codex: CodexSummary): 
     if (agent.agent === "codex" && !codexViaGateway) continue;
     const binding = payload?.gateway.bindings[agent.agent];
     const stats = activity.find((item) => item.agent === agent.agent);
-    const model = binding?.enabled ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";
+    const model = binding?.enabled && !agent.manual ? modelDisplay(payload, binding.model, binding.poolExclude ?? []).title : "";
     nodes.push({
       id: agent.agent,
       name: agent.name,
       enabled: agent.enabled,
       direct: false,
       detail: model,
+      ...(agent.manual ? { manualModels: agent.manual.models.length } : {}),
       requests: stats?.requests ?? 0,
       live: agent.enabled && Boolean(stats && (stats.inFlight.length > 0 || stats.requests > 0)),
     });
