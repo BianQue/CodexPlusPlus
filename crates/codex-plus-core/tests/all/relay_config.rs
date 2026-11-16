@@ -3,7 +3,7 @@ use codex_plus_core::relay_config::{
     apply_pure_api_config_to_home, apply_relay_config_file_to_home, apply_relay_config_to_home,
     apply_relay_files_to_home, apply_relay_files_to_home_with_common,
     apply_relay_profile_files_to_home_with_context, apply_relay_profile_to_home_with_switch_rules,
-    apply_relay_profile_to_home_with_switch_rules_and_proxy_port,
+    apply_relay_profile_to_home_with_switch_rules_and_proxy_port, apply_relay_profile_with_preservation,
     backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
     chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
     clear_managed_proxy_config_for_uninstall, clear_relay_config_to_home,
@@ -812,6 +812,114 @@ enabled = false
     assert!(updated.contains("enabled = false"));
     // 同时不能破坏既有的供应商隔离行为。
     assert!(updated.contains("[model_providers.custom]"));
+}
+
+/// 回归（#3016，opt-in）：打开「切换时保留」后，profile 快照里同 id 的
+/// 旧 MCP 条目不能让用户在 live 里改好的配置回退；live 的完整条目覆盖模板副本。
+#[test]
+fn preserved_apply_keeps_live_mcp_entry_over_stale_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5"
+
+[mcp_servers.my_tool]
+command = "/opt/tools/new/bin"
+args = ["--config", "/opt/tools/new/config.json"]
+
+[mcp_servers.my_tool.env]
+API_TOKEN = "new-token"
+"#,
+    )
+    .unwrap();
+    let profile = pure_api_profile_named(
+        "中转",
+        r#"model = "qwen3-coder"
+
+[mcp_servers.my_tool]
+command = "/opt/tools/old/bin"
+args = ["--config", "/opt/tools/old/config.json"]
+"#,
+    );
+
+    apply_relay_profile_with_preservation(temp.path(), &profile, "", 57321, true).unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert!(updated.contains("/opt/tools/new/bin"), "{updated}");
+    assert!(updated.contains("/opt/tools/new/config.json"));
+    assert!(updated.contains("API_TOKEN"));
+    assert!(
+        !updated.contains("/opt/tools/old"),
+        "模板里的旧路径不能回退 live 的新配置：{updated}"
+    );
+}
+
+/// #3016 例外：Codex++ 自己生成并按实例补全的 MCP 条目仍以目标（模板）为准，
+/// 不能被 live 里的旧端口 / 旧路径盖回。
+#[test]
+fn preserved_apply_keeps_snapshot_for_owned_mcp_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5"
+
+[mcp_servers.codex_plus_collaboration]
+command = "/old/codex-plus"
+args = ["--codex-plus-agent-mcp", "--port", "1111"]
+"#,
+    )
+    .unwrap();
+    let profile = pure_api_profile_named(
+        "中转",
+        r#"model = "qwen3-coder"
+
+[mcp_servers.codex_plus_collaboration]
+command = "/current/codex-plus"
+args = ["--codex-plus-agent-mcp", "--port", "2222"]
+"#,
+    );
+
+    apply_relay_profile_with_preservation(temp.path(), &profile, "", 57321, true).unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert!(updated.contains("/current/codex-plus"), "{updated}");
+    assert!(updated.contains("2222"));
+    assert!(
+        !updated.contains("/old/codex-plus"),
+        "托管条目不能被 live 的旧副本覆盖：{updated}"
+    );
+}
+
+/// #3016 默认行为不变：不开「切换时保留」时模板快照里的同 id 条目仍胜出。
+#[test]
+fn unpreserved_apply_keeps_snapshot_mcp_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5"
+
+[mcp_servers.my_tool]
+command = "/opt/tools/new/bin"
+"#,
+    )
+    .unwrap();
+    let profile = pure_api_profile_named(
+        "中转",
+        r#"model = "qwen3-coder"
+
+[mcp_servers.my_tool]
+command = "/opt/tools/old/bin"
+"#,
+    );
+
+    apply_relay_profile_with_preservation(temp.path(), &profile, "", 57321, false).unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+
+    assert!(updated.contains("/opt/tools/old/bin"), "{updated}");
+    assert!(
+        !updated.contains("/opt/tools/new/bin"),
+        "未开保留时模板仍胜出：{updated}"
+    );
 }
 
 /// 上式负例：live 里本来就没有 plugins 时不得凭空注入空段。
@@ -2877,7 +2985,9 @@ enabled = true
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     assert!(config.contains("[mcp_servers.enabled_one]"));
     assert!(config.contains("[plugins.enabled_two]"));
-    assert!(!config.contains("[plugins.disabled_one]"));
+    // 插件停用要写成 `enabled = false`：条目被删掉，Codex 就当它没装（#3115）。
+    let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["plugins"]["disabled_one"]["enabled"].as_bool(), Some(false), "{config}");
     assert!(!config.contains("[skills.disabled_skill]"));
 }
 
@@ -2920,7 +3030,7 @@ experimental_bearer_token = "sk-new"
     )
     .unwrap();
     assert!(catalog.contains(r#""context_window": 200000"#), "{catalog}");
-    assert!(catalog.contains(r#""max_context_window": 200000"#), "{catalog}");
+    assert!(catalog.contains(r#""max_context_window": null"#), "{catalog}");
 }
 
 #[test]
@@ -4983,7 +5093,74 @@ enabled = true
 
     assert!(updated.contains(r#"[plugins."github@openai-curated"]"#), "{updated}");
     assert!(updated.contains(r#"[plugins."figma@openai-curated"]"#), "{updated}");
-    assert!(!updated.contains(r#"[plugins."notion@codex-plus-market"]"#), "{updated}");
+    // 停用的插件留在 live 里写成 `enabled = false`，不是整条删掉（#3115）。
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(
+        doc["plugins"]["notion@codex-plus-market"]["enabled"].as_bool(),
+        Some(false),
+        "{updated}"
+    );
+}
+
+/// #3115：在「插件配置」里停用内置插件（列表行的 Codex 标签、或编辑成 `enabled = false`）。
+/// Codex 把 config.toml 里没有条目的插件当成「未安装」，内置插件随后会被当作启用装回，
+/// 所以停用必须在 live 里落成 `enabled = false`；再启用时改回 true。
+#[test]
+fn disabling_a_live_bundled_plugin_writes_enabled_false_instead_of_removing_it() {
+    let live = r#"model = "gpt-5"
+
+[plugins."chrome@openai-bundled"]
+enabled = true
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#;
+    let disabled = r#"[plugins."chrome@openai-bundled"]
+enabled = false
+"#;
+
+    let updated = sync_live_config_context_entries(live, disabled).unwrap();
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["plugins"]["chrome@openai-bundled"]["enabled"].as_bool(), Some(false), "{updated}");
+    assert_eq!(doc["plugins"]["browser@openai-bundled"]["enabled"].as_bool(), Some(true), "{updated}");
+    assert_eq!(updated.matches(r#"[plugins."chrome@openai-bundled"]"#).count(), 1, "{updated}");
+
+    let enabled = r#"[plugins."chrome@openai-bundled"]
+enabled = true
+"#;
+    let updated = sync_live_config_context_entries(&updated, enabled).unwrap();
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["plugins"]["chrome@openai-bundled"]["enabled"].as_bool(), Some(true), "{updated}");
+}
+
+/// 切换供应商的 apply 流程同样要把停用的托管插件写成 `enabled = false`，
+/// 不能被 live 里旧的 `enabled = true` 补回，也不能整条删掉（#3115）。
+#[test]
+fn relay_apply_writes_disabled_managed_plugin_as_enabled_false() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"model = "gpt-5"
+
+[plugins."chrome@openai-bundled"]
+enabled = true
+"#,
+    )
+    .unwrap();
+    let mut profile = pure_api_profile_named("中转", r#"model = "qwen3-coder""#);
+    profile.use_common_config = true;
+
+    apply_relay_profile_with_preservation(
+        temp.path(),
+        &profile,
+        "[plugins.\"chrome@openai-bundled\"]\nenabled = false\n",
+        57321,
+        false,
+    )
+    .unwrap();
+    let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = config.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(doc["plugins"]["chrome@openai-bundled"]["enabled"].as_bool(), Some(false), "{config}");
 }
 
 #[test]
@@ -5663,8 +5840,7 @@ experimental_bearer_token = "sk-new"
         .find(|model| model["slug"] == "gpt-5.6-sol")
         .unwrap();
     assert_eq!(sol["context_window"], 272_000);
-    // 未显式配置窗口时保留官方模板上限（issue #2191）。
-    assert_eq!(sol["max_context_window"], 872_000);
+    assert!(sol["max_context_window"].is_null());
     assert_eq!(sol["default_reasoning_level"], "low");
     assert_eq!(sol["service_tiers"][0]["id"], "priority");
     assert_eq!(sol["supports_search_tool"], true);
@@ -6230,8 +6406,7 @@ base_url = "https://relay.example/v1"
     let astra = &catalog["models"][0];
     assert_eq!(astra["slug"], "gpt-6-astra");
     assert_eq!(astra["context_window"], 272_000);
-    // 未显式配置窗口时保留官方模板上限（issue #2191）。
-    assert_eq!(astra["max_context_window"], 872_000);
+    assert!(astra["max_context_window"].is_null());
     assert_eq!(astra["use_responses_lite"], false);
     assert_eq!(astra["additional_speed_tiers"], serde_json::json!(["fast"]));
     assert_eq!(astra["service_tiers"][0]["id"], "priority");
@@ -6284,7 +6459,7 @@ base_url = "https://relay.example/v1"
     assert_eq!(model["display_name"], "GPT-6.1-Sol");
     assert_eq!(model["default_reasoning_level"], "medium");
     assert_eq!(model["context_window"], 272_000);
-    assert_eq!(model["max_context_window"], 872_000);
+    assert!(model["max_context_window"].is_null());
     assert_eq!(model["use_responses_lite"], false);
     assert_eq!(model["multi_agent_version"], "v2");
     assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
@@ -6304,7 +6479,7 @@ base_url = "https://relay.example/v1"
     apply_relay_profile_files_to_home_with_context(temp.path(), &overridden, "").unwrap();
     let model = read_model();
     assert_eq!(model["context_window"], 200_000);
-    assert_eq!(model["max_context_window"], 200_000);
+    assert!(model["max_context_window"].is_null());
 
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, "").unwrap();
     assert_eq!(read_model()["context_window"], 272_000);
@@ -6345,7 +6520,7 @@ base_url = "https://relay.example/v1"
             expected_efforts.push("ultra");
         }
         assert_eq!(model["context_window"], 272_000);
-        assert_eq!(model["max_context_window"], 872_000);
+        assert!(model["max_context_window"].is_null());
         assert_eq!(model["use_responses_lite"], false);
         assert_eq!(model["multi_agent_version"], "v2");
         assert_eq!(model["additional_speed_tiers"], serde_json::json!(["fast"]));
@@ -7518,7 +7693,7 @@ experimental_bearer_token = "sk-new"
     assert_eq!(model["supports_search_tool"], true);
     assert_eq!(model["vendor_extension"]["source"], "models.json");
     assert_eq!(model["context_window"], 1_000_000);
-    assert_eq!(model["max_context_window"], 1_000_000);
+    assert!(model["max_context_window"].is_null());
     assert_eq!(model["auto_compact_token_limit"], 700_000);
     assert_eq!(model["effective_context_window_percent"], 4);
     assert_eq!(model["priority"], 5);
@@ -7803,7 +7978,7 @@ base_url = "https://relay.example.test/v1"
     assert_eq!(model["priority"], 3);
     // 窗口仍按生成器管辖：未显式配置时取供应商元数据的 1M（而非粘贴残留值）
     assert_eq!(model["context_window"], 1_048_576);
-    assert_eq!(model["max_context_window"], 1_048_576);
+    assert!(model["max_context_window"].is_null());
 }
 
 /// Kimi 官方 Responses 接口不认 `tool_search` 工具（整单 400）：即使没配窗口也要落
@@ -8435,7 +8610,11 @@ fn issue_2583_profile(mode: RelayMode, snapshot: &str) -> RelayProfile {
     }
 }
 
-fn issue_2583_assert_live_paths_win(home: &std::path::Path, config: &str) {
+fn issue_2583_assert_live_paths_win(
+    home: &std::path::Path,
+    config: &str,
+    live_mcp_entry_wins: bool,
+) {
     let p = |text: &str| issue_2583_paths(home, text);
     let value: toml::Value = config.parse().unwrap();
     let servers = &value["mcp_servers"];
@@ -8470,12 +8649,18 @@ fn issue_2583_assert_live_paths_win(home: &std::path::Path, config: &str) {
     let expected_notify =
         p(r"C:\Users\u\AppData\Local\OpenAI\Codex\runtimes\cua_node\1fb7137c46617d50\bin\codex-computer-use.exe");
     assert_eq!(notify, vec![expected_notify.as_str(), "turn-ended"]);
-    // 用户自己的 MCP 条目仍以快照为准，live 只补缺。
-    assert_eq!(servers["my_tool"]["command"].as_str(), Some("snapshot-tool"));
-    assert_eq!(
-        servers["my_tool"]["args"].as_array().unwrap()[0].as_str(),
-        Some("--from-snapshot")
-    );
+    // 用户自己的 MCP 条目：默认仍以快照为准，live 只补缺；
+    // 打开「切换时保留」后（#3016）以 live 为准。
+    if live_mcp_entry_wins {
+        assert_eq!(servers["my_tool"]["command"].as_str(), Some("live-tool"));
+        assert!(servers["my_tool"].get("args").is_none());
+    } else {
+        assert_eq!(servers["my_tool"]["command"].as_str(), Some("snapshot-tool"));
+        assert_eq!(
+            servers["my_tool"]["args"].as_array().unwrap()[0].as_str(),
+            Some("--from-snapshot")
+        );
+    }
 }
 
 #[test]
@@ -8489,7 +8674,7 @@ fn apply_pure_api_profile_keeps_live_codex_managed_mcp_paths() {
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    issue_2583_assert_live_paths_win(temp.path(), &config);
+    issue_2583_assert_live_paths_win(temp.path(), &config, false);
 }
 
 #[test]
@@ -8540,7 +8725,7 @@ fn launcher_preservation_path_keeps_live_codex_managed_mcp_paths() {
     .unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    issue_2583_assert_live_paths_win(temp.path(), &config);
+    issue_2583_assert_live_paths_win(temp.path(), &config, true);
 }
 
 #[test]
@@ -8776,4 +8961,113 @@ fn stale_codex_managed_mcp_in_snapshot_is_dropped_when_live_is_empty() {
     )
     .unwrap();
     assert!(!out.contains("node_repl"), "{out}");
+}
+
+/// 回归（#3115）：`[[skills.config]]` 是按 path / name 列条的数组，切换渠道时
+/// 不能把整段换成模板里的那几条。模板同 path 的条目覆盖，其余 live 条目保留。
+#[test]
+fn apply_relay_config_preserves_live_skills_config_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        r#"[[skills.config]]
+path = "/home/u/.codex/skills/alpha/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "/home/u/.codex/skills/beta/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "/home/u/.codex/skills/gamma/SKILL.md"
+enabled = false
+"#,
+    )
+    .unwrap();
+    let common = r#"[[skills.config]]
+path = "/home/u/.codex/skills/beta/SKILL.md"
+enabled = true
+"#;
+    let profile = RelayProfile {
+        id: "relay-a".to_string(),
+        name: "Relay A".to_string(),
+        model: "gpt-5".to_string(),
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "gpt-5"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+base_url = "https://relay.example.test/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
+        use_common_config: true,
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_files_to_home_with_context(temp.path(), &profile, common).unwrap();
+    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+    let entries: Vec<(String, bool)> = doc["skills"]["config"]
+        .as_array_of_tables()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["path"].as_str().unwrap().to_string(),
+                entry["enabled"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        vec![
+            ("/home/u/.codex/skills/alpha/SKILL.md".to_string(), false),
+            ("/home/u/.codex/skills/beta/SKILL.md".to_string(), true),
+            ("/home/u/.codex/skills/gamma/SKILL.md".to_string(), false),
+        ],
+        "live 的自定义条目要保留，模板同 path 的条目覆盖：{updated}"
+    );
+}
+
+#[test]
+fn normalize_config_text_keeps_every_repeated_array_of_tables_entry() {
+    // issue #3115：`[[skills.config]]` 一个条目一个块，逐块合并阶段必须按条目
+    // 追加，不能用「后出现的块整棵覆盖数组」——否则切换供应商后用户写在
+    // config.toml / 通用配置里的 N 条技能启停规则会塌缩成最后一条。
+    let mut text = String::from("model = \"gpt-x\"\n\n");
+    for index in 0..5 {
+        text.push_str(&format!(
+            "[[skills.config]]\npath = \"C:\\\\Users\\\\u\\\\.codex\\\\skills\\\\skill{index}\\\\SKILL.md\"\nenabled = false\n\n"
+        ));
+    }
+    text.push_str("[[skills.config]]\npath = \"C:\\\\Users\\\\u\\\\.codex\\\\skills\\\\Chinesizing\\\\SKILL.md\"\nenabled = true\n");
+    let normalized = codex_plus_core::relay_config::normalize_config_text(&text);
+    assert_eq!(normalized.matches("[[skills.config]]").count(), 6);
+    assert!(normalized.contains("Chinesizing"));
+    assert!(normalized.contains("skill0"));
+    assert!(normalized.contains("skill4"));
+}
+
+#[test]
+fn normalize_config_text_still_merges_repeated_standard_tables_last_wins() {
+    // 守住原有语义：标准表重复声明时仍按键合并、后值覆盖（与 merge_toml_item
+    // 数组表追加分支互补，不改变标准表的既有行为）。
+    let normalized = codex_plus_core::relay_config::normalize_config_text(
+        "[mcp_servers.node_repl]\ncommand = \"old\"\n\n[mcp_servers.node_repl]\ncommand = \"new\"\nargs = [\"-y\"]\n",
+    );
+    let doc = normalized.parse::<toml_edit::DocumentMut>().unwrap();
+    let server = &doc["mcp_servers"]["node_repl"];
+    assert_eq!(
+        server.get("command").and_then(|value| value.as_str()),
+        Some("new")
+    );
+    assert_eq!(
+        server
+            .get("args")
+            .and_then(|value| value.as_array())
+            .map(|array| array.len()),
+        Some(1)
+    );
 }

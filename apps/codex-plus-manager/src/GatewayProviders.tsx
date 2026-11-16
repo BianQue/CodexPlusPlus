@@ -17,6 +17,7 @@ import { relayBillingGatewayCacheKey, type RelayBillingProbe } from "./relay-bil
 import {
   glanceAgents,
   defaultProviderAgents,
+  connectedAgents,
   failureLabel,
   formatRemaining,
   gatewayPresets,
@@ -27,6 +28,7 @@ import {
   pendingImportCount,
   presetAdded,
   presetHost,
+  poolExcludeToggle,
   protocolLabel,
   providerEnabled,
   providerInput,
@@ -41,6 +43,7 @@ import {
   type ProviderDraft,
   type ProviderPrice,
   maskAccountName,
+  imageModelLabel,
   isDirectProxy,
   keyLabel,
   type ImportCandidate,
@@ -54,6 +57,7 @@ import { AgentIcon, Avatar, KeyCount, MemberStatusLabel, QuotaWindows, Switch, t
 import { ProviderFormDialog, type ProviderFormState } from "./ProviderFormDialog";
 import { ProviderExtrasDialog, ProviderLimitsDialog, ProviderNewApiAccessDialog, keyLimitSummary, priceSummary } from "./ProviderExtrasDialog";
 import { ProviderWindowsDialog, windowSummary, withUnlistedWindows } from "./ProviderWindowsDialog";
+import { withUnlistedAutoCompact } from "./gateway-auto-compact-model";
 import { ProviderReasoningDialog, reasoningSummary } from "./ProviderReasoningDialog";
 import { ProviderModelsDialog } from "./ProviderModelsDialog";
 import { ProviderSyncDialog } from "./ProviderSyncDialog";
@@ -217,10 +221,10 @@ export function ProvidersView({
     if (form?.mode !== "edit") return;
     if (await run(`edit:${form.entry.id}`, "update_gateway_provider", { id: form.entry.id, input: providerInput(draft) }, t("保存供应商"))) closeForm();
   };
-  const saveFormWindows = async (modelWindows: Record<string, number>, fallback: number | null) => {
+  const saveFormWindows = async (modelWindows: Record<string, number>, fallback: number | null, autoCompact: { models: Record<string, number>; fallback: number | null }) => {
     if (!editingEntry || !formWindows) return;
     const windows = withUnlistedWindows(editingEntry, formWindows, modelWindows);
-    if (await run(`windows:${editingEntry.id}`, "save_gateway_provider_windows", { id: editingEntry.id, windows, fallback }, t("保存上下文窗口"))) setFormWindows(null);
+    if (await run(`windows:${editingEntry.id}`, "save_gateway_provider_windows", { id: editingEntry.id, windows, fallback, autoCompact: withUnlistedAutoCompact(editingEntry, formWindows, autoCompact) }, t("保存上下文窗口"))) setFormWindows(null);
   };
 
   return (
@@ -280,8 +284,9 @@ export function ProvidersView({
       ) : null}
       {adding ? <ProviderAdder busy={busy} notify={notify} onClose={() => setAdding(false)} payload={payload} run={run} startWith={adding === "import" ? "import" : "catalog"} /> : null}
       {loginDialog}
-      {form ? (
+      {form?.mode === "edit" ? (
         <ProviderFormDialog
+          agentPicks={<EditAgentPicks busy={busy} entry={editingEntry ?? form.entry} payload={payload} run={run} />}
           busy={busy}
           form={form}
           onCancel={closeForm}
@@ -296,7 +301,7 @@ export function ProvidersView({
           busy={busy !== null}
           entry={{ ...editingEntry, models: formWindows }}
           onCancel={() => setFormWindows(null)}
-          onSave={(modelWindows, fallback) => void saveFormWindows(modelWindows, fallback)}
+          onSave={(modelWindows, fallback, autoCompact) => void saveFormWindows(modelWindows, fallback, autoCompact)}
         />
       ) : null}
     </>
@@ -643,8 +648,8 @@ function PoolRow({
     if (await run(`reasoning:${entry.id}`, "save_gateway_provider_metadata", { id: entry.id, modelMetadata }, t("保存思考等级"))) setReasoningOpen(false);
   };
   const windows = windowSummary(entry);
-  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null) => {
-    if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback }, t("保存上下文窗口"))) setWindowsOpen(false);
+  const saveWindows = async (modelWindows: Record<string, number>, fallback: number | null, autoCompact: { models: Record<string, number>; fallback: number | null }) => {
+    if (await run(`windows:${entry.id}`, "save_gateway_provider_windows", { id: entry.id, windows: modelWindows, fallback, autoCompact }, t("保存上下文窗口"))) setWindowsOpen(false);
   };
   // 从上游同步上下文窗口 / 思考等级（#2807）：先列差异，勾选后才写入。订阅账号的模型接口不带这些资料。
   const [metaSync, setMetaSync] = useState<MetaSyncKind | null>(null);
@@ -740,7 +745,7 @@ function PoolRow({
             </button>
           )}
           <Switch
-            disabled={busy !== null}
+            pending={busy !== null}
             label={tf("{0} 参与调度", [maskAccountName(entry.name)])}
             on={enabled}
             onToggle={() => void run(`toggle:${entry.id}`, "set_gateway_provider_enabled", { id: entry.id, enabled: !enabled }, t("切换供应商"), true)}
@@ -783,7 +788,7 @@ function PoolRow({
             <div className="gw-detail-row">
               <span className="gw-detail-label">{t("生图模型")}</span>
               <div className="gw-detail-value gw-chip-row">
-                {imageModels.map((model) => <code className="gw-chip" key={model}>{model}</code>)}
+                {imageModels.map((model) => <code className="gw-chip" key={model}>{imageModelLabel(model, entry.account === "chatgpt")}</code>)}
               </div>
               <span className="gw-detail-actions gw-detail-hint" title={entry.account === "chatgpt" ? t("ChatGPT 后端自己选生图模型；在「Agent 接入」里选用哪个") : t("Agent 不和它们对话，不在模型列表里；在「Agent 接入」里选用哪个")}>
                 {t("在「Agent 接入」里选用")}
@@ -984,7 +989,7 @@ function PoolRow({
         <ProviderReasoningDialog busy={busy !== null} entry={entry} onCancel={() => setReasoningOpen(false)} onSave={(modelMetadata) => void saveReasoning(modelMetadata)} />
       ) : null}
       {windowsOpen ? (
-        <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback) => void saveWindows(modelWindows, fallback)} />
+        <ProviderWindowsDialog busy={busy !== null} entry={entry} onCancel={() => setWindowsOpen(false)} onSave={(modelWindows, fallback, autoCompact) => void saveWindows(modelWindows, fallback, autoCompact)} />
       ) : null}
       {accessOpen ? (
         <ProviderNewApiAccessDialog
@@ -1062,6 +1067,42 @@ function AgentPicks({ payload, picked, onChange }: { payload: GatewayPayload | n
 }
 
 type CatalogItem = { key: string; name: string; added?: boolean; icon?: ReactNode; onClick: () => void };
+
+/** 编辑时给哪些 Agent 用（#3030）：每个已接入 Agent 一个开关，改的是各自的「挑选」排除列表。 */
+function EditAgentPicks({ payload, busy, run, entry }: { payload: GatewayPayload | null; busy: string | null; run: Run; entry: GatewayPoolEntry }) {
+  const focus = useAgentFocus();
+  const connected = connectedAgents(payload);
+  // 只列已接入的 Agent：没接入的谈不上用不用这家供应商。
+  const agents = visibleAgents(focus, glanceAgents(payload?.agents)).filter((agent) => connected.includes(agent.agent));
+  if (!agents.length || singleAgent(focus)) return null;
+  const toggle = (agent: GatewayAgentId, on: boolean) => {
+    const binding = payload?.gateway.bindings[agent];
+    if (!binding) return;
+    void run(`pool:${agent}:${entry.id}`, "save_gateway_binding", { agent, binding: { ...binding, poolExclude: poolExcludeToggle(binding.poolExclude, entry.id, on) } }, t("保存网关绑定"));
+  };
+  return (
+    <div className="gw-agent-picks">
+      <span>{t("给这些 Agent 用")}</span>
+      {agents.map((agent) => {
+        const on = !(payload?.gateway.bindings[agent.agent]?.poolExclude ?? []).includes(entry.id);
+        return (
+          <button
+            aria-pressed={on}
+            data-on={on}
+            disabled={busy !== null}
+            key={agent.agent}
+            onClick={() => toggle(agent.agent, !on)}
+            type="button"
+          >
+            <AgentIcon agent={agent.agent} className="gw-agent-pick-icon" />
+            {agent.name}
+            {on ? <Check className="h-3.5 w-3.5" /> : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 /** 「添加供应商」目录：订阅、供应商（厂商 API）、中转、本机；「导入…」从直连模式复制。 */
 function ProviderCatalog({

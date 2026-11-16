@@ -274,15 +274,31 @@
       installThreadScrollNavigationCapture();
       installThreadScrollUserIntentCapture();
       installThreadScrollRouteHooks();
-      scheduleThreadScrollSync(true);
+      // 可见性恢复和普通 DOM 补扫不是导航，不能重新锁住旧的阅读位置。
+      scheduleThreadScrollSync();
     }, { phase: "light" });
     ctx.onScan(() => scheduleThreadScrollSync());
-    const stopWhenOff = () => {
-      if (!codexPlusSettings().threadScrollRestore) stopThreadScrollRestore();
+    let enabled = threadScrollRestoreEnabled();
+    let disabled = codexPlusBackendSettingsLoaded && codexPlusBackendSettings.codexAppThreadScrollRestore === false;
+    const onSettings = () => {
+      const nextEnabled = threadScrollRestoreEnabled();
+      if (enabled && !nextEnabled) {
+        stopThreadScrollRestore();
+        threadScrollRuntime().activeSessionId = currentThreadScrollSessionId();
+      }
+      if (!enabled && nextEnabled) {
+        clearThreadScrollRestoreTimers();
+        if (disabled) threadScrollRuntime().activeSessionId = currentThreadScrollSessionId();
+        syncThreadScrollState();
+        if (!disabled) scheduleThreadScrollSyncAttempts(true);
+      }
+      enabled = nextEnabled;
+      disabled = codexPlusBackendSettingsLoaded && codexPlusBackendSettings.codexAppThreadScrollRestore === false;
     };
-    ctx.on("settings/changed", () => runScanStep(stopWhenOff));
+    ctx.on("settings/changed", () => runScanStep(onSettings));
+    ctx.on("settings/loaded", () => runScanStep(onSettings));
     codexPlusAlignWith(ctx, () => {
-      stopWhenOff();
+      if (!threadScrollRestoreEnabled()) stopThreadScrollRestore();
       scheduleDeferredScan();
     });
   }

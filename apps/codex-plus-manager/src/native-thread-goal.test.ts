@@ -190,6 +190,7 @@ function fixture(source = runtimeSource) {
     performance: { getEntriesByType: () => [] },
     URL,
     crypto: { randomUUID: () => `fixture-request-${++state.uuidCount}` },
+    codexGatewayRecoveryEnabled: () => false,
   });
   vm.runInContext(source, context);
   const api = context.window.__codexPlusNativeThreadGoal;
@@ -992,6 +993,7 @@ describe("native thread goal renderer integration", () => {
       const calls: string[] = [];
       Object.assign(f.context, {
         codexPlusBackendSettingsLoaded: true,
+        codexPerModelContextEnabled: () => false,
         codexPlusExtensionWantsRequestMiddleware: () => false,
         codexPlusModelUnlockEnabled: () => true,
         codexPluginMarketplacePatchEnabled: () => false,

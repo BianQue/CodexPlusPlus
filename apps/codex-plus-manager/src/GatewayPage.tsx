@@ -38,7 +38,7 @@ import {
   memberTarget,
   type AutoGroupEntry,
 } from "./gateway-model";
-import { AgentsView, Floating, ModelList } from "./GatewayAgents";
+import { AgentsView, Floating, ModelList, type CodexRunControls } from "./GatewayAgents";
 import { AppSelect } from "./AppSelect";
 import { ProvidersView } from "./GatewayProviders";
 import { SessionsView } from "./GatewaySessions";
@@ -82,6 +82,7 @@ export function GatewayPage({
   onTabChange,
   extraSettings,
   onOpenCodexProviderSettings,
+  codexRun,
 }: {
   notify: Notify;
   tab?: Tab;
@@ -89,6 +90,8 @@ export function GatewayPage({
   /** 「网关设置」末尾附加的内容：主窗口传进来的新旧共用本地服务设置。 */
   extraSettings?: ReactNode;
   onOpenCodexProviderSettings?: () => void;
+  /** Codex 行的启动 / 停止：主窗口传进来才显示，不传就只留模型选择与接入开关。 */
+  codexRun?: CodexRunControls;
 }) {
   const [payload, setPayload] = useState<GatewayPayload | null>(memo.payload);
   const [busy, setBusy] = useState<string | null>(memo.payload ? null : "load");
@@ -228,7 +231,7 @@ export function GatewayPage({
             <span>{t("本地网关当前没有运行，走网关的 Agent 会连不上。请重新保存一次绑定或重启 Codex++。")}</span>
           </p>
         ) : null}
-        {tab === "agents" ? <AgentsView busy={busy} notify={notify} onManage={() => setTab("providers")} onOpenCodexProviderSettings={onOpenCodexProviderSettings} payload={payload} run={run} /> : null}
+        {tab === "agents" ? <AgentsView busy={busy} codexRun={codexRun} notify={notify} onManage={() => setTab("providers")} onOpenCodexProviderSettings={onOpenCodexProviderSettings} payload={payload} run={run} /> : null}
         {tab === "sessions" ? <SessionsView notify={notify} /> : null}
         {tab === "providers" ? <ProvidersView busy={busy} notify={notify} payload={payload} run={run} /> : null}
         {tab === "routing" ? <RoutingView busy={busy} payload={payload} run={run} /> : null}
@@ -447,7 +450,7 @@ function GroupCard({
           </Menu>
         </div>
         <span className="gw-route-group-switch" title={t("启用模型组")}>
-          <Switch disabled={disabled} label={tf("启用模型组 {0}", [group.name])} on={auto ? !(group as AutoGroupEntry).hidden : !group.disabled} onToggle={onToggleEnabled} />
+          <Switch label={tf("启用模型组 {0}", [group.name])} pending={disabled} on={auto ? !(group as AutoGroupEntry).hidden : !group.disabled} onToggle={onToggleEnabled} />
         </span>
       </header>
       <ol className="gw-route-members" data-manual={manual}>
@@ -820,11 +823,11 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
             />
           </CxRow>
           <CxRow detail={restoreHint} title={t("退出 Codex++ 时恢复直连")} tooltip={restoreHint}>
-            <Switch disabled={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />
+            <Switch pending={busy !== null} label={t("退出 Codex++ 时恢复直连")} on={restoreOnExit} onToggle={() => saveOptions(mode, !restoreOnExit)} />
           </CxRow>
           <CxRow detail={suffixHint} title={t("模型名后带供应商")} tooltip={suffixHint}>
             <Switch
-              disabled={busy !== null}
+              pending={busy !== null}
               label={t("模型名后带供应商")}
               on={modelSuffix}
               onToggle={() => void run("model-suffix", "save_gateway_model_suffix", { enabled: !modelSuffix }, t("保存网关选项"), true)}
@@ -832,7 +835,7 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
           </CxRow>
           <CxRow detail={discoveryHint} title={t("发现本机已登录的订阅账号")} tooltip={discoveryHint}>
             <Switch
-              disabled={busy !== null}
+              pending={busy !== null}
               label={t("发现本机已登录的订阅账号")}
               on={localDiscovery}
               onToggle={() => void run("local-login-discovery", "save_gateway_local_login_discovery", { enabled: !localDiscovery }, t("保存网关选项"), true)}
@@ -844,7 +847,7 @@ function GatewayView({ payload, busy, run }: { payload: GatewayPayload | null; b
             tooltip={t("默认让子智能体继承父回合的模型和供应商，避免被悄悄换到别家；打开后按 Codex 实际请求的模型发送，例如 code review 指定了别的模型。")}
           >
             <Switch
-              disabled={busy !== null}
+              pending={busy !== null}
               label={t("子智能体使用自己请求的模型")}
               on={subagentFollow}
               onToggle={() => void run("subagentModel", "save_gateway_subagent_model_policy", { followRequest: !subagentFollow }, t("保存子智能体模型策略"), true)}

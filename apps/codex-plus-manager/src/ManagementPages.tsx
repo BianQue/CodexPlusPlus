@@ -11,7 +11,7 @@ import { AppSelect } from "./AppSelect";
 import { matchesManagementQuery, sessionGroups, skillRepoKey, type ManagedSession } from "./management-model";
 import { TopbarActions } from "./TopbarActions";
 import { AgentGlyph } from "./HubOverview";
-import { MCP_AGENTS, mcpCount, mcpOn, mcpPresent, mergeMcpRows, type AgentMcpConfig, type McpAgentId, type McpRow } from "./agent-mcp-model";
+import { MCP_AGENTS, editedEnabledState, mcpCount, mcpOn, mcpPresent, mergeMcpRows, type AgentMcpConfig, type McpAgentId, type McpRow } from "./agent-mcp-model";
 import { agentVisible } from "./agent-focus-model";
 import { useAgentFocus } from "./agent-focus-store";
 import "./ManagementPages.css";
@@ -120,8 +120,8 @@ export function MatrixCell({ name, enabled, disabled, onToggle, agent = "codex",
   return <button className="mg-cell" type="button" aria-pressed={enabled} aria-label={`${name} · ${agentLabel(agent)}：${enabled ? t("已启用") : t("已停用")}`} title={hint ? `${agentLabel(agent)}：${hint}` : `${name} · ${agentLabel(agent)}`} disabled={disabled} onClick={onToggle}><span data-on={enabled}>{enabled && <Check size={12} strokeWidth={3} />}</span></button>;
 }
 /** 行内的一个 Agent 开关胶囊：图标 + 名字，开了是实心。悬停显示它的配置文件位置。 */
-export function AgentToggle({ name, enabled, disabled, onToggle, agent, title, hint }: { name: string; enabled: boolean; disabled?: boolean; onToggle: () => void; agent: McpAgentId; title?: string; hint?: string }) {
-  return <button className="cx-agent-toggle" type="button" aria-pressed={enabled} aria-label={`${name} · ${agentLabel(agent)}：${enabled ? t("已启用") : t("已停用")}`} title={hint ? `${agentLabel(agent)}：${hint}` : title ? `${agentLabel(agent)} · ${title}` : agentLabel(agent)} disabled={disabled} onClick={(event) => { event.stopPropagation(); onToggle(); }}><AgentGlyph agent={agent} /><span>{agentLabel(agent)}</span></button>;
+export function AgentToggle({ name, enabled, disabled, onToggle, agent, title, hint, statusUnknown }: { name: string; enabled: boolean; disabled?: boolean; onToggle: () => void; agent: McpAgentId; title?: string; hint?: string; statusUnknown?: boolean }) {
+  return <button className="cx-agent-toggle" type="button" aria-pressed={statusUnknown ? undefined : enabled} aria-label={`${name} · ${agentLabel(agent)}：${statusUnknown ? t("状态未知") : enabled ? t("已启用") : t("已停用")}`} title={hint ? `${agentLabel(agent)}：${hint}` : title ? `${agentLabel(agent)} · ${title}` : agentLabel(agent)} disabled={disabled} onClick={(event) => { event.stopPropagation(); onToggle(); }}><AgentGlyph agent={agent} /><span>{agentLabel(agent)}</span></button>;
 }
 async function copyValue(text: string, notify: Notify) {
   try { await navigator.clipboard.writeText(text); await notify(t("复制"), t("已复制。"), "ok"); }
@@ -230,10 +230,15 @@ export function McpPage({ entries, onSave, onDelete, onRefresh, onImport, notify
       onSave={(id, body, targets) => write(async () => {
         // 表体可能取自某家停用的条目（带 enabled = false），先统一成启用，再按各家原来的启停状态写回；
         // 否则写到 Claude 时会被当成「停用即移除」。
+        // 例外：用户在编辑器里亲手改了启停行（插件只能这样改），Codex 以用户写的为准——
+        // 以前这里一律改回原状态，「编辑 → enabled = false → 保存」等于什么都没写（#3115）。
         const base = enabledBody(body, true);
+        const edited = editedEnabledState(editor.row?.body, body);
         for (const agent of targets) {
           const previous = editor.row?.byAgent[agent];
-          const next = previous && !previous.enabled && agent !== "claude" ? enabledBody(base, false) : base;
+          const next = agent === "codex" && edited !== undefined
+            ? enabledBody(base, edited)
+            : previous && !previous.enabled && agent !== "claude" ? enabledBody(base, false) : base;
           if (!(await writeAgent(agent, id, next))) return false;
         }
         setEditor(null);

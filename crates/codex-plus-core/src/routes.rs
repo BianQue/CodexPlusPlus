@@ -73,6 +73,10 @@ pub trait BridgeSettingsService: Send + Sync {
     async fn get_settings(&self) -> anyhow::Result<BackendSettings>;
     async fn set_settings(&self, payload: Value) -> anyhow::Result<BackendSettings>;
 
+    fn codex_home_dir(&self) -> PathBuf {
+        crate::relay_config::default_codex_home_dir()
+    }
+
     async fn codex_app_version(&self) -> anyhow::Result<String> {
         Ok(String::new())
     }
@@ -293,6 +297,9 @@ pub trait BridgeDataService: Send + Sync {
     async fn recover_remote_control_session(&self, _thread_id: String) -> anyhow::Result<Value> {
         anyhow::bail!("Remote Control session recovery is unavailable")
     }
+    async fn prepare_thread_provider(&self, _request: Value) -> anyhow::Result<Value> {
+        Ok(json!({"status": "unavailable", "changed": false, "message": "Thread provider preparation is unavailable"}))
+    }
 }
 
 /// 拓展脚本在独立 Codex 页面（例如宠物 overlay）执行表达式。
@@ -364,6 +371,19 @@ pub async fn handle_bridge_request(
     );
     let result = match path {
         "/settings/get" => settings_value(&ctx, ctx.settings.get_settings().await).await,
+        "/gateway/connection-generation" => match ctx.settings.get_settings().await {
+            Ok(settings) => {
+                let active = settings.relay_profiles_enabled
+                    && settings.active_relay_id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID;
+                if active {
+                    crate::gateway::connection_generation::read(&ctx.settings.codex_home_dir())
+                        .map(|generation| json!({ "status": "ok", "active": true, "generation": generation }))
+                } else {
+                    Ok(json!({ "status": "ok", "active": false, "generation": "" }))
+                }
+            }
+            Err(error) => Err(error),
+        },
         "/dictation/status" => ctx.settings.get_settings().await.map(|settings| {
             let effective = crate::dictation::effective_settings(&settings);
             let mut status = crate::dictation::public_status(&effective);
@@ -466,7 +486,12 @@ pub async fn handle_bridge_request(
             }
         }
         "/user-scripts/load" => ctx.runtime.load_user_scripts().await,
-        "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
+        "/user-scripts/reload" => match ctx.runtime.reload_user_scripts().await {
+            Err(error) if error.is::<crate::user_scripts::ReloadOutcomeUnknown>() => {
+                Ok(json!({ "status": "unknown", "message": error.to_string() }))
+            }
+            result => result,
+        },
         "/cdp/targets" => ctx.runtime.cdp_targets().await,
         "/cdp/evaluate" => ctx.runtime.cdp_evaluate(payload.clone()).await,
         // 系统鼠标位置：拓展写「桌宠跟随鼠标」这类功能用（页面里拿不到窗口外的鼠标）。只读。
@@ -502,6 +527,7 @@ pub async fn handle_bridge_request(
         "/backend/status" => backend_status_value(
             ctx.runtime.backend_status().await,
             ctx.settings.get_settings().await,
+            &ctx.settings.codex_home_dir(),
         ),
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         // 开放给拓展的模型目录：只给模型列表与每模型元数据（含上下文窗口），去掉来源地址、config 路径。
@@ -677,6 +703,15 @@ pub async fn handle_bridge_request(
                 .unwrap_or_default()
                 .to_string();
             ctx.data.recover_remote_control_session(thread_id).await
+        }
+        "/thread-provider/prepare" => {
+            if payload.get("host_id").and_then(Value::as_str) != Some("local")
+                || !payload.get("hostId").is_none_or(|host| host.as_str() == Some("local"))
+            {
+                Err(anyhow::anyhow!("Thread provider preparation is local-only"))
+            } else {
+                ctx.data.prepare_thread_provider(payload.clone()).await
+            }
         }
         "/thread-resume-model-metadata" => {
             let request = payload.clone();
@@ -1126,6 +1161,7 @@ impl BridgeDataService for UnavailableDataService {
 fn settings_payload_value(
     mut settings: BackendSettings,
     codex_app_version: String,
+    is_multi_instance: bool,
 ) -> anyhow::Result<Value> {
     let managed_session_connection = managed_session_connection(&settings);
     let active_relay_session_provider = settings.active_relay_session_provider();
@@ -1138,6 +1174,7 @@ fn settings_payload_value(
     // 页面心跳比较这两项，发拓展事件 relayProfile/switched、modelCatalog/changed（见 40-backend-settings.js）。
     let active_relay_profile_public = public_active_relay_profile(&settings);
     let catalog_fingerprint = model_catalog_fingerprint(&settings);
+    let catalog_source_identity = model_catalog_source_identity(&settings);
     let mut value = serde_json::to_value(settings)?;
     fn remove_named_keys(value: &mut Value) {
         match value {
@@ -1187,6 +1224,8 @@ fn settings_payload_value(
         );
         object.insert("activeRelayProfilePublic".to_string(), active_relay_profile_public);
         object.insert("modelCatalogFingerprint".to_string(), Value::String(catalog_fingerprint));
+        object.insert("modelCatalogSourceIdentity".to_string(), Value::String(catalog_source_identity));
+        object.insert("codexMultiInstance".to_string(), Value::Bool(is_multi_instance));
         object.insert(
             "nativeFastLocalApiConfigured".to_string(),
             Value::Bool(native_fast.native_fast_local_api_configured),
@@ -1221,26 +1260,80 @@ fn public_active_relay_profile(settings: &BackendSettings) -> Value {
 fn model_catalog_fingerprint(settings: &BackendSettings) -> String {
     use std::hash::{Hash, Hasher};
     let profile = settings.active_relay_profile();
-    let aggregate = settings
-        .active_aggregate_relay_profile()
-        .and_then(|aggregate| serde_json::to_string(&aggregate).ok())
-        .unwrap_or_default();
+    let aggregate = settings.active_aggregate_relay_profile();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (
-        settings.relay_profiles_enabled,
-        profile.id.as_str(),
-        profile.name.as_str(),
-        crate::relay_config::relay_profile_model(&profile),
-        profile.model_list.as_str(),
-        profile.model_windows.as_str(),
-        profile.model_auto_compact.as_str(),
-        profile.model_metadata.as_str(),
-        profile.context_window.as_str(),
-        profile.auto_compact_limit.as_str(),
-        aggregate,
-    )
+    let hash_profile = |profile: &crate::settings::RelayProfile,
+                        hasher: &mut std::collections::hash_map::DefaultHasher| {
+        (
+            profile.id.as_str(),
+            profile.name.as_str(),
+            profile.model.as_str(),
+            crate::relay_config::relay_profile_model(profile),
+            profile.model_list.as_str(),
+            profile.model_windows.as_str(),
+            profile.model_auto_compact.as_str(),
+            profile.model_metadata.as_str(),
+            profile.context_window.as_str(),
+            profile.auto_compact_limit.as_str(),
+            crate::official_login::is_official_login_profile(profile),
+            crate::relay_config::upstream_rejects_tool_search(profile),
+        )
+            .hash(&mut *hasher);
+        crate::relay_rotation::member_relay_ready(profile).hash(hasher);
+    };
+    settings.relay_profiles_enabled.hash(&mut hasher);
+    hash_profile(&profile, &mut hasher);
+    if profile.id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID {
+        crate::model_catalog::gateway_catalog_revision(&crate::codex_home::default_codex_home_dir())
+            .hash(&mut hasher);
+    }
+    aggregate
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
         .hash(&mut hasher);
+    if let Some(aggregate) = aggregate {
+        for member in &aggregate.members {
+            member.relay_id.hash(&mut hasher);
+            let member_profile = settings
+                .relay_profiles
+                .iter()
+                .find(|profile| profile.id == member.relay_id);
+            member_profile.is_some().hash(&mut hasher);
+            if let Some(member_profile) = member_profile {
+                hash_profile(member_profile, &mut hasher);
+            }
+        }
+    }
     format!("{:016x}", hasher.finish())
+}
+
+/// 只供内部载荷比较连接来源，不向第三方拓展暴露。
+fn model_catalog_source_identity(settings: &BackendSettings) -> String {
+    use sha2::{Digest, Sha256};
+
+    let profile = settings.active_relay_profile();
+    let base_url = crate::relay_config::relay_profile_base_url(&profile);
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex-plus-model-catalog-source-v1\0");
+    for value in [
+        profile.id.as_str(),
+        base_url.as_str(),
+        match profile.protocol {
+            crate::settings::RelayProtocol::Responses => "responses",
+            crate::settings::RelayProtocol::ChatCompletions => "chatCompletions",
+            crate::settings::RelayProtocol::AnthropicMessages => "anthropicMessages",
+        },
+        match profile.relay_mode {
+            crate::settings::RelayMode::Official => "official",
+            crate::settings::RelayMode::MixedApi => "mixedApi",
+            crate::settings::RelayMode::PureApi => "pureApi",
+            crate::settings::RelayMode::Aggregate => "aggregate",
+        },
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 /// `/settings/public`：拓展可读的设置子集。
@@ -1363,7 +1456,7 @@ mod dictation_privacy_tests {
     fn dictation_settings_bridge_removes_asr_key() {
         let mut settings = BackendSettings::default();
         settings.dictation.api_key = "fake-asr-private-key".to_string();
-        let result = settings_payload_value(settings, String::new()).unwrap();
+        let result = settings_payload_value(settings, String::new(), false).unwrap();
         assert!(result["dictation"].get("apiKey").is_none());
         assert_eq!(result["dictation"]["apiKeyConfigured"], true);
         assert!(!result.to_string().contains("fake-asr-private-key"));
@@ -1375,17 +1468,55 @@ mod dictation_privacy_tests {
         settings.relay_profiles[0].api_keys = vec![crate::settings::RelayApiKey {
             id: "backup".into(), name: "备用".into(), api_key: "fake-backup-secret".into(),
         }];
-        let result = settings_payload_value(settings, String::new()).unwrap();
+        let result = settings_payload_value(settings, String::new(), false).unwrap();
         assert!(result["relayProfiles"][0].get("apiKeys").is_none());
         assert!(!result.to_string().contains("fake-backup-secret"));
     }
+
+    #[test]
+    fn settings_bridge_reports_multi_instance_without_enabling_relay_switching() {
+        let mut settings = BackendSettings::default();
+        settings.relay_profiles_enabled = false;
+        for is_multi_instance in [false, true] {
+            let result =
+                settings_payload_value(settings.clone(), String::new(), is_multi_instance).unwrap();
+            assert_eq!(result["codexMultiInstance"], is_multi_instance);
+            assert_eq!(result["relayProfilesEnabled"], false);
+            assert!(result["managedSessionConnection"].is_null());
+        }
+    }
+
+    #[test]
+    fn gateway_catalog_change_advances_heartbeat_without_a_settings_save() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("model-catalogs/codex-plus-gateway.json");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "model_catalog_json = 'model-catalogs/codex-plus-gateway.json'\n").unwrap();
+        let mut settings = BackendSettings::default();
+        settings.active_relay_id = crate::gateway::apply::CODEX_GATEWAY_RELAY_ID.into();
+        settings.settings_revision = "worker-snapshot".into();
+        let status = || backend_status_value(Ok(json!({"status":"ok"})), Ok(settings.clone()), home.path()).unwrap();
+        std::fs::write(&path, r#"{"models":[{"slug":"old"}]}"#).unwrap();
+        let before = status();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        assert_eq!(status(), before);
+        std::fs::write(&path, r#"{"models":[{"slug":"new"}]}"#).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(modified).unwrap();
+        let updated = std::fs::metadata(&path).unwrap();
+        assert_eq!(updated.modified().unwrap(), modified);
+        assert_eq!(updated.len(), metadata.len());
+        assert_ne!(status()["settingsRevision"], before["settingsRevision"]);
+    }
+
     #[test]
     fn dictation_settings_bridge_applies_enhancement_switch_without_mutating_settings() {
         let mut settings = BackendSettings::default();
         settings.enhancements_enabled = false;
         settings.dictation.enabled = true;
         settings.dictation.api_key = "fake-asr-private-key".to_string();
-        let result = settings_payload_value(settings.clone(), String::new()).unwrap();
+        let result = settings_payload_value(settings.clone(), String::new(), false).unwrap();
         assert_eq!(result["dictation"]["enabled"], false);
         assert_eq!(result["dictation"]["apiKeyConfigured"], true);
         assert!(settings.dictation.enabled);
@@ -1399,12 +1530,17 @@ async fn settings_value(
 ) -> anyhow::Result<Value> {
     let settings = result?;
     let codex_app_version = ctx.settings.codex_app_version().await.unwrap_or_default();
-    settings_payload_value(settings, codex_app_version)
+    settings_payload_value(
+        settings,
+        codex_app_version,
+        std::env::var_os("CODEX_PLUS_MULTI_INSTANCE").as_deref() == Some(std::ffi::OsStr::new("1")),
+    )
 }
 
 fn backend_status_value(
     status: anyhow::Result<Value>,
     settings: anyhow::Result<BackendSettings>,
+    home: &std::path::Path,
 ) -> anyhow::Result<Value> {
     let mut status = status?;
     if let Some(object) = status.as_object_mut() {
@@ -1418,7 +1554,15 @@ fn backend_status_value(
         // /settings/get（166 KB 的 JSON，编解码开销全落在渲染进程主线程上）。
         let revision = settings
             .as_ref()
-            .map(|settings| settings.settings_revision.clone())
+            .map(|settings| {
+                // 多开实例的设置独立保存，但 Agent 发布的网关目录仍可更新。
+                if settings.active_relay_id == crate::gateway::apply::CODEX_GATEWAY_RELAY_ID
+                    && let Some(catalog_revision) = crate::model_catalog::gateway_catalog_revision(home)
+                {
+                    return format!("{}:{catalog_revision:016x}", settings.settings_revision);
+                }
+                settings.settings_revision.clone()
+            })
             .unwrap_or_default();
         object.insert("settingsRevision".to_string(), Value::from(revision));
     }
@@ -1727,6 +1871,41 @@ fn empty_user_script_inventory() -> Value {
         "enabled": true,
         "scripts": []
     })
+}
+
+#[cfg(test)]
+mod thread_provider_prepare_route_tests {
+    use super::*;
+
+    fn context() -> BridgeContext {
+        BridgeContext::core(Arc::new(CoreRuntimeService::new(
+            0,
+            StatusStore::new(PathBuf::from("unused-thread-provider-status.json")),
+        )))
+    }
+
+    #[tokio::test]
+    async fn thread_provider_prepare_route_defaults_to_explicit_unavailable() {
+        let response = handle_bridge_request(context(), "/thread-provider/prepare", json!({
+            "host_id": "local", "thread_id": "thread-1",
+            "source_provider": "openai", "target_provider": "custom",
+        })).await;
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["changed"], false);
+    }
+
+    #[tokio::test]
+    async fn thread_provider_prepare_route_rejects_unknown_or_conflicting_hosts() {
+        for payload in [
+            json!({}),
+            json!({"host_id": "ssh"}),
+            json!({"host_id": "local", "hostId": "ssh"}),
+        ] {
+            let response = handle_bridge_request(context(), "/thread-provider/prepare", payload).await;
+            assert_eq!(response["status"], "failed");
+            assert!(response["message"].as_str().unwrap().contains("local-only"));
+        }
+    }
 }
 
 #[cfg(test)]

@@ -4,11 +4,12 @@ use codex_plus_core::gateway::apply::{
     ApplyContext, GroupInput, ProviderInput, codex_gateway_profile_on, codex_importable,
     copy_claude_provider, copy_codex_provider, create_provider, delete_group, delete_provider,
     disable_binding, enable_binding, note_claude_switched, note_codex_switched, provider_reasoning,
-    reapply_if_port_changed, refresh_enabled, reorder_providers, save_group, set_provider_enabled,
-    set_provider_metadata, set_provider_windows, update_provider,
+    reapply_if_port_changed, refresh_enabled, reorder_providers, reset_model_selections, save_group,
+    set_provider_enabled, set_provider_metadata, set_provider_windows, update_provider,
 };
 use codex_plus_core::gateway::store::{
-    AgentBinding, ClaudeRoleModels, GatewayStore, GroupMember, GroupMode, GroupSticky,
+    AgentBinding, ClaudeRoleModels, DefaultModelSelection, GatewayStore, GroupMember, GroupMode,
+    GroupSticky,
 };
 use codex_plus_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codex_plus_core::tools::ToolId;
@@ -478,6 +479,1153 @@ fn codex_enable_switches_to_managed_gateway_profile_and_disable_switches_back() 
     assert_eq!(binding.restore.codex_previous_relay_id, "direct");
 }
 
+#[test]
+fn codex_connection_generation_tracks_connection_writes_without_catalog_noise() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), "");
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let first = connection_generation::read(&ctx.codex_home).unwrap();
+    uuid::Uuid::parse_str(&first).unwrap();
+
+    refresh_enabled(ctx).unwrap();
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+    let mut changed_model = binding();
+    changed_model.model = "deepseek-v4-flash".into();
+    enable_binding(ctx, &ToolId::Codex, changed_model.clone()).unwrap();
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+
+    let mut moved = ctx.clone();
+    moved.port += 1;
+    assert_eq!(reapply_if_port_changed(&moved).unwrap(), 1);
+    let port_generation = connection_generation::read(&ctx.codex_home).unwrap();
+    assert_ne!(port_generation, first);
+
+    let path = ctx.codex_home.join("config.toml");
+    let live = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, live.replace("/gw/codex/v1", "/external/v1")).unwrap();
+    enable_binding(&moved, &ToolId::Codex, changed_model).unwrap();
+    let restored = connection_generation::read(&ctx.codex_home).unwrap();
+    assert_ne!(restored, port_generation);
+
+    assert_eq!(codex_plus_core::gateway::apply::reapply_enabled(&moved).unwrap(), 1);
+    let reapply = connection_generation::read(&ctx.codex_home).unwrap();
+    assert_ne!(reapply, restored);
+    assert_eq!(connection_generation::read(&fixture._temp.path().join("other-home")).unwrap(), "");
+}
+
+#[test]
+fn codex_connection_generation_serializes_concurrent_publications() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let temp = tempfile::tempdir().unwrap();
+    let threads: Vec<_> = (0..8).map(|_| {
+        let home = temp.path().to_path_buf();
+        std::thread::spawn(move || connection_generation::publish(&home).unwrap())
+    }).collect();
+    let generations: std::collections::HashSet<_> =
+        threads.into_iter().map(|thread| thread.join().unwrap()).collect();
+    assert_eq!(generations.len(), 8);
+    assert!(generations.contains(&connection_generation::read(temp.path()).unwrap()));
+}
+
+#[test]
+fn codex_connection_generation_allows_reconnect_from_invalid_external_config() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let first = connection_generation::read(&ctx.codex_home).unwrap();
+    std::fs::write(ctx.codex_home.join("config.toml"), "model_provider = [").unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    assert_ne!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+    assert!(codex_config(ctx).contains("/gw/codex/v1"));
+}
+
+#[test]
+fn codex_connection_generation_waits_for_explicit_reconnect_publication() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let first = connection_generation::read(&ctx.codex_home).unwrap();
+    std::fs::write(ctx.codex_home.join("config.toml"), "model_provider = [").unwrap();
+    let (_, changed) = codex_plus_core::gateway::apply::enable_binding_deferred(ctx, &ToolId::Codex, binding()).unwrap();
+    assert!(changed);
+    assert!(codex_config(ctx).contains("/gw/codex/v1"));
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), first);
+    let second = connection_generation::publish(&ctx.codex_home).unwrap();
+    assert_ne!(second, first);
+    let (_, changed) = codex_plus_core::gateway::apply::enable_binding_deferred(ctx, &ToolId::Codex, binding()).unwrap();
+    assert!(!changed);
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), second);
+    assert_ne!(connection_generation::publish(&ctx.codex_home).unwrap(), second);
+}
+
+#[test]
+fn codex_token_rotation_defers_generation_until_helper_is_ready() {
+    use codex_plus_core::gateway::connection_generation;
+
+    let fixture = fixture(57395);
+    let ctx = &fixture.ctx;
+    seed_direct_with_user_root_settings(ctx);
+    let before = enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let old_token = &before.binding(&ToolId::Codex).unwrap().token;
+    let generation = connection_generation::read(&ctx.codex_home).unwrap();
+
+    let (saved, changed) = codex_plus_core::gateway::apply::rotate_binding_token(ctx, &ToolId::Codex).unwrap();
+    let new_token = &saved.binding(&ToolId::Codex).unwrap().token;
+    assert_ne!(new_token, old_token);
+    assert!(changed);
+    assert!(codex_config(ctx).contains(new_token));
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), generation);
+    assert_ne!(connection_generation::publish(&ctx.codex_home).unwrap(), generation);
+}
+
+#[test]
+fn codex_catalog_keeps_single_provider_qualified_default_grouped_once() {
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut seeded = BackendSettings::default();
+    seeded.relay_profiles_enabled = true;
+    ctx.settings.save(&seeded).unwrap();
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro".into();
+    enable_binding(ctx, &ToolId::Codex, selected).unwrap();
+
+    let catalog = codex_catalog(ctx);
+    let models = catalog["models"].as_array().unwrap();
+    let matching: Vec<_> = models.iter().filter(|item| {
+        matches!(item["slug"].as_str(), Some("deepseek/deepseek-v4-pro" | "deepseek-v4-pro"))
+    }).collect();
+    assert_eq!(matching.len(), 1, "{matching:?}");
+    assert_eq!(matching[0]["slug"], "deepseek/deepseek-v4-pro");
+    assert_eq!(matching[0]["codex_plus_group_id"], "deepseek");
+    assert_eq!(matching[0]["codex_plus_group"], "DeepSeek");
+}
+
+#[test]
+fn codex_catalog_preserves_selected_and_legacy_default_models() {
+    let _state = crate::common::IsolatedTestState::new();
+    for (model, with_selection) in [
+        ("deepseek/deepseek-v4-pro", true),
+        ("deepseek/deepseek-v4-pro", false),
+        ("deepseek-v4-pro", false),
+    ] {
+        let fixture = fixture(57394);
+        let ctx = &fixture.ctx;
+        std::fs::create_dir_all(&ctx.codex_home).unwrap();
+        ctx.settings
+            .save(&BackendSettings {
+                relay_profiles_enabled: true,
+                ..BackendSettings::default()
+            })
+            .unwrap();
+        set_provider_metadata(
+            &ctx.gateway,
+            "deepseek",
+            &json!({
+                "deepseek-v4-pro": {
+                    "display_name": "Private DeepSeek",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                    "default_reasoning_level": "high"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (_, other) = create_provider(
+            &ctx.gateway,
+            &ProviderInput {
+                name: "Other".into(),
+                model: "other-model".into(),
+                model_list: "other-model".into(),
+                ..deepseek_input()
+            },
+            "",
+            None,
+        )
+        .unwrap();
+        let mut selected = binding();
+        selected.model = model.into();
+        if with_selection {
+            selected.default_model_selection = Some(DefaultModelSelection {
+                provider_id: "deepseek".into(),
+                upstream_model: "deepseek-v4-pro".into(),
+                provider_source: "preset:deepseek".into(),
+                provider_removed: false,
+            });
+        }
+        let gateway = enable_binding(ctx, &ToolId::Codex, selected).unwrap();
+        let binding = gateway.binding(&ToolId::Codex).unwrap();
+        let expected = codex_plus_core::gateway::route::codex_binding_models(&gateway, binding);
+        assert_eq!(
+            codex_plus_core::gateway::server::exposed_models(&gateway, &ToolId::Codex),
+            expected
+        );
+
+        let catalog = codex_catalog(ctx);
+        let models = catalog["models"].as_array().unwrap();
+        let slugs: Vec<_> = models
+            .iter()
+            .map(|entry| entry["slug"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(slugs, expected, "{model}, selection={with_selection}");
+        let matching: Vec<_> = models
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry["slug"].as_str(),
+                    Some("deepseek/deepseek-v4-pro" | "deepseek-v4-pro")
+                )
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "{model}, selection={with_selection}");
+        assert_eq!(matching[0]["slug"], model);
+        assert_eq!(matching[0]["codex_plus_group_id"], "deepseek");
+        assert_eq!(matching[0]["codex_plus_group"], "DeepSeek");
+        assert_eq!(matching[0]["display_name"], "Private DeepSeek");
+        assert_eq!(matching[0]["default_reasoning_level"], "high");
+        assert_eq!(models[0]["slug"], model);
+        let other_model = models
+            .iter()
+            .find(|entry| entry["slug"] == "other-model")
+            .unwrap();
+        assert_eq!(other_model["codex_plus_group_id"], other);
+    }
+}
+
+#[test]
+fn pinned_default_survives_a_new_provider_and_bare_default_keeps_its_meaning() {
+    use codex_plus_core::gateway::route::{codex_pool_models, resolve_plan};
+
+    let fixture = fixture(57394);
+    let mut gateway = fixture.ctx.gateway.load().unwrap();
+    let mut selected = binding();
+    selected.enabled = true;
+    selected.model = "deepseek/deepseek-v4-pro".into();
+    gateway.bindings.insert("codex".into(), selected.clone());
+
+    let models = codex_pool_models(&gateway, &selected);
+    assert!(models.contains(&selected.model));
+    assert!(!models.contains(&"deepseek-v4-pro".to_string()));
+
+    let mut mirror = gateway.providers[0].clone();
+    mirror.relay.id = "mirror".into();
+    gateway.providers.push(mirror);
+    gateway.auto_models = true;
+    let models = codex_pool_models(&gateway, &selected);
+    assert!(models.contains(&selected.model));
+    assert!(models.contains(&"mirror/deepseek-v4-pro".to_string()));
+    assert!(models.contains(&"deepseek-v4-pro".to_string()));
+    let pinned = resolve_plan(&gateway, &ToolId::Codex, &selected.model, None).unwrap();
+    assert_eq!(pinned.candidates.len(), 1);
+    assert_eq!(pinned.candidates[0].relay.id, "deepseek");
+    let bare = resolve_plan(&gateway, &ToolId::Codex, "deepseek-v4-pro", None).unwrap();
+    assert_eq!(bare.candidates.len(), 2);
+
+    gateway.auto_models = false;
+    assert!(!codex_pool_models(&gateway, &selected).contains(&"deepseek-v4-pro".to_string()));
+    let bare = resolve_plan(&gateway, &ToolId::Codex, "deepseek-v4-pro", None).unwrap();
+    assert_eq!(bare.candidates.len(), 2);
+
+    selected.model = "deepseek-v4-pro".into();
+    gateway.providers.pop();
+    let models = codex_pool_models(&gateway, &selected);
+    assert!(models.contains(&"deepseek-v4-pro".to_string()));
+    assert!(!models.contains(&"deepseek/deepseek-v4-pro".to_string()));
+}
+
+#[test]
+fn selected_provider_default_rejects_a_later_native_name_collision() {
+    use codex_plus_core::gateway::route::{preview_plan, resolve_plan};
+
+    let fixture = fixture(57394);
+    let mut gateway = fixture.ctx.gateway.load().unwrap();
+    let mut selected = serde_json::to_value(binding()).unwrap();
+    selected["enabled"] = json!(true);
+    selected["model"] = json!("deepseek/deepseek-v4-pro");
+    selected["defaultModelSelection"] = json!({
+        "providerId": "deepseek",
+        "upstreamModel": "deepseek-v4-pro",
+        "providerSource": "preset:deepseek"
+    });
+    let selected: AgentBinding = serde_json::from_value(selected).unwrap();
+    gateway.bindings.insert("codex".into(), selected.clone());
+
+    let before = resolve_plan(&gateway, &ToolId::Codex, &selected.model, None).unwrap();
+    assert_eq!(before.candidates[0].relay.id, "deepseek");
+    assert_eq!(before.candidates[0].upstream_model, "deepseek-v4-pro");
+
+    let mut other = gateway.providers[0].clone();
+    other.relay.id = "other".into();
+    other.relay.model = selected.model.clone();
+    other.relay.model_list = selected.model.clone();
+    gateway.providers.push(other);
+
+    let error = resolve_plan(&gateway, &ToolId::Codex, &selected.model, None)
+        .expect_err("明确选择的默认模型不能被同名原生模型静默改派");
+    assert!(error.to_string().contains("冲突"), "{error:#}");
+    assert!(preview_plan(&gateway, &ToolId::Codex, &selected.model, None).is_err());
+
+    let mut legacy = serde_json::to_value(selected).unwrap();
+    legacy.as_object_mut().unwrap().remove("defaultModelSelection");
+    let legacy: AgentBinding = serde_json::from_value(legacy).unwrap();
+    gateway.bindings.insert("codex".into(), legacy);
+    let native = resolve_plan(&gateway, &ToolId::Codex, "deepseek/deepseek-v4-pro", None)
+        .unwrap();
+    assert_eq!(native.candidates[0].relay.id, "other");
+    assert_eq!(native.candidates[0].upstream_model, "deepseek/deepseek-v4-pro");
+}
+
+#[test]
+fn selected_provider_default_rejects_an_existing_collision_before_writing() {
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let config_before = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    let binding_before = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
+
+    ctx.gateway.update(|gateway| {
+        let mut other = gateway.providers[0].clone();
+        other.relay.id = "other".into();
+        other.relay.model = "deepseek/deepseek-v4-pro".into();
+        other.relay.model_list = other.relay.model.clone();
+        gateway.providers.push(other);
+        Ok(())
+    }).unwrap();
+    let mut selected = serde_json::to_value(binding_before.clone()).unwrap();
+    selected["model"] = json!("deepseek/deepseek-v4-pro");
+    selected["defaultModelSelection"] = json!({
+        "providerId": "deepseek",
+        "upstreamModel": "deepseek-v4-pro",
+        "providerSource": "preset:deepseek"
+    });
+    let error = enable_binding(ctx, &ToolId::Codex, serde_json::from_value(selected).unwrap())
+        .expect_err("不能保存有歧义的默认模型");
+    assert!(error.to_string().contains("冲突"), "{error:#}");
+    assert_eq!(std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap(), config_before);
+    assert_eq!(ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap(), &binding_before);
+}
+
+#[test]
+fn unavailable_selected_default_falls_back_but_explicit_request_stays_pinned() {
+    use codex_plus_core::gateway::route::resolve_plan;
+    use codex_plus_core::gateway::store::UnknownModelPolicy;
+
+    let fixture = fixture(57394);
+    let mut gateway = fixture.ctx.gateway.load().unwrap();
+    let mut selected = serde_json::to_value(binding()).unwrap();
+    selected["enabled"] = json!(true);
+    selected["model"] = json!("deepseek/deepseek-v4-pro");
+    selected["defaultModelSelection"] = json!({
+        "providerId": "deepseek",
+        "upstreamModel": "deepseek-v4-pro",
+        "providerSource": "preset:deepseek"
+    });
+    let mut selected: AgentBinding = serde_json::from_value(selected).unwrap();
+    let mut mirror = gateway.providers[0].clone();
+    mirror.relay.id = "mirror".into();
+    gateway.providers.push(mirror);
+    gateway.providers[0].enabled = false;
+    gateway.bindings.insert("codex".into(), selected.clone());
+    assert!(resolve_plan(&gateway, &ToolId::Codex, &selected.model, None).is_err());
+    for model in ["", "unknown"] {
+        let plan = resolve_plan(&gateway, &ToolId::Codex, model, None).unwrap();
+        assert_eq!(plan.candidates[0].relay.id, "mirror");
+        assert_eq!(plan.candidates[0].upstream_model, "deepseek-v4-pro");
+    }
+    let mut conflicting_fallback = gateway.clone();
+    codex_plus_core::relay_config::set_relay_profile_model(
+        &mut conflicting_fallback.providers[1].relay,
+        &selected.model,
+    ).unwrap();
+    conflicting_fallback.providers[1].relay.model_list = format!("{}\nsafe-model", selected.model);
+    let plan = resolve_plan(&conflicting_fallback, &ToolId::Codex, "", None).unwrap();
+    assert_eq!(plan.candidates[0].relay.id, "mirror");
+    assert_eq!(plan.candidates[0].upstream_model, "safe-model");
+
+    selected.unknown_model = UnknownModelPolicy::Passthrough;
+    gateway.bindings.insert("codex".into(), selected.clone());
+    let plan = resolve_plan(&gateway, &ToolId::Codex, "unknown", None).unwrap();
+    assert_eq!(plan.candidates[0].relay.id, "mirror");
+    assert_eq!(plan.candidates[0].upstream_model, "unknown");
+
+    gateway.providers[0].enabled = true;
+    selected.pool_exclude.push("deepseek".into());
+    gateway.bindings.insert("codex".into(), selected.clone());
+    assert!(resolve_plan(&gateway, &ToolId::Codex, &selected.model, None).is_err());
+    assert_eq!(
+        resolve_plan(&gateway, &ToolId::Codex, "", None).unwrap().candidates[0].relay.id,
+        "mirror"
+    );
+
+    selected.pool_exclude.clear();
+    gateway.providers[0].source = "extension:replacement".into();
+    gateway.bindings.insert("codex".into(), selected.clone());
+    assert!(resolve_plan(&gateway, &ToolId::Codex, &selected.model, None).is_err());
+    assert_eq!(
+        resolve_plan(&gateway, &ToolId::Codex, "", None).unwrap().candidates[0].relay.id,
+        "deepseek"
+    );
+    gateway.providers[0].source = "preset:deepseek".into();
+    assert_eq!(
+        resolve_plan(&gateway, &ToolId::Codex, "", None).unwrap().candidates[0].relay.id,
+        "deepseek"
+    );
+}
+
+#[test]
+fn enabled_selected_default_refreshes_after_a_native_name_collision() {
+    use codex_plus_core::gateway::route::{preview_plan, resolve_plan};
+    use codex_plus_core::gateway::store::UnknownModelPolicy;
+
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro[1M]".into();
+    selected.context_window = None;
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Claude, selected).unwrap();
+    assert_eq!(read_settings_json(ctx)["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
+
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Native".into(),
+            model: "deepseek/deepseek-v4-pro".into(),
+            model_list: "deepseek/deepseek-v4-pro".into(),
+            ..deepseek_input()
+        },
+        "preset:native",
+        None,
+    ).unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
+    let settings = read_settings_json(ctx);
+    assert_eq!(settings["env"]["ANTHROPIC_MODEL"], "deepseek-v4-pro");
+    assert!(settings["env"].get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").is_none());
+    let mut gateway = ctx.gateway.load().unwrap();
+    assert!(gateway.provider("deepseek").unwrap().enabled);
+    for policy in [UnknownModelPolicy::MapToDefault, UnknownModelPolicy::Passthrough] {
+        gateway.bindings.get_mut("claude").unwrap().unknown_model = policy.clone();
+        for plan in [resolve_plan, preview_plan] {
+            for requested in ["", "unknown"] {
+                let routed = plan(&gateway, &ToolId::Claude, requested, None).unwrap();
+                assert_eq!(routed.candidates[0].relay.id, "deepseek");
+                let expected = if requested == "unknown" && policy == UnknownModelPolicy::Passthrough {
+                    "unknown"
+                } else {
+                    "deepseek-v4-pro"
+                };
+                assert_eq!(routed.candidates[0].upstream_model, expected);
+            }
+            assert!(plan(&gateway, &ToolId::Claude, "deepseek/deepseek-v4-pro", None).is_err());
+        }
+    }
+
+    let mut saved = ctx.gateway.load().unwrap().binding(&ToolId::Claude).unwrap().clone();
+    assert_eq!(saved.model, "deepseek/deepseek-v4-pro[1M]");
+    saved.context_window = Some(123_456);
+    enable_binding(ctx, &ToolId::Claude, saved).unwrap();
+    assert_eq!(read_settings_json(ctx)["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "123456");
+
+    let mut saved = ctx.gateway.load().unwrap().binding(&ToolId::Claude).unwrap().clone();
+    saved.context_window = None;
+    enable_binding(ctx, &ToolId::Claude, saved).unwrap();
+    delete_provider(&ctx.gateway, "native").unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
+    let saved = ctx.gateway.load().unwrap().binding(&ToolId::Claude).unwrap().clone();
+    assert_eq!(saved.model, "deepseek/deepseek-v4-pro[1M]");
+    assert_eq!(read_settings_json(ctx)["env"]["ANTHROPIC_MODEL"], "deepseek/deepseek-v4-pro");
+    assert_eq!(read_settings_json(ctx)["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "1000000");
+    let restored = resolve_plan(&ctx.gateway.load().unwrap(), &ToolId::Claude, "", None).unwrap();
+    assert_eq!(restored.candidates[0].relay.id, "deepseek");
+}
+
+#[test]
+fn disabled_selected_default_refreshes_and_recovers_when_enabled() {
+    use codex_plus_core::gateway::route::resolve_plan;
+
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro[1M]".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Claude, selected).unwrap();
+
+    set_provider_enabled(&ctx.gateway, "deepseek", false).unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
+    assert_eq!(read_settings_json(ctx)["env"]["ANTHROPIC_MODEL"], "deepseek-v4-pro");
+    let saved = ctx.gateway.load().unwrap().binding(&ToolId::Claude).unwrap().clone();
+    assert_eq!(saved.model, "deepseek/deepseek-v4-pro[1M]");
+    assert!(resolve_plan(&ctx.gateway.load().unwrap(), &ToolId::Claude, &saved.model, None).is_err());
+    assert_eq!(codex_plus_core::gateway::apply::reapply_enabled(ctx).unwrap(), 1);
+
+    let mut invalid = saved.clone();
+    invalid.model = "missing/other-model".into();
+    invalid.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "missing".into(),
+        upstream_model: "other-model".into(),
+        provider_source: "preset:missing".into(),
+        provider_removed: false,
+    });
+    assert!(enable_binding(ctx, &ToolId::Claude, invalid).is_err());
+    enable_binding(ctx, &ToolId::Claude, saved).unwrap();
+
+    ctx.gateway.update(|gateway| {
+        let mirror = gateway.providers.iter_mut().find(|provider| provider.relay.id == "mirror").unwrap();
+        codex_plus_core::relay_config::set_relay_profile_model(&mut mirror.relay, "deepseek/deepseek-v4-pro")?;
+        mirror.relay.model_list = "deepseek/deepseek-v4-pro".into();
+        Ok(())
+    }).unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
+    assert_eq!(read_settings_json(ctx)["env"]["ANTHROPIC_MODEL"], "mirror/deepseek/deepseek-v4-pro");
+    let gateway = ctx.gateway.load().unwrap();
+    for model in ["", "unknown"] {
+        let plan = resolve_plan(&gateway, &ToolId::Claude, model, None).unwrap();
+        assert_eq!(plan.candidates[0].relay.id, "mirror");
+        assert_eq!(plan.candidates[0].upstream_model, "deepseek/deepseek-v4-pro");
+    }
+    assert!(resolve_plan(&gateway, &ToolId::Claude, "deepseek/deepseek-v4-pro", None).is_err());
+    ctx.gateway.update(|gateway| {
+        let mirror = gateway.providers.iter_mut().find(|provider| provider.relay.id == "mirror").unwrap();
+        codex_plus_core::relay_config::set_relay_profile_model(&mut mirror.relay, "deepseek-v4-pro")?;
+        mirror.relay.model_list = "deepseek-v4-pro\ndeepseek-v4-flash".into();
+        Ok(())
+    }).unwrap();
+
+    set_provider_enabled(&ctx.gateway, "deepseek", true).unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
+    assert_eq!(
+        read_settings_json(ctx)["env"]["ANTHROPIC_MODEL"],
+        "deepseek/deepseek-v4-pro"
+    );
+    let plan = resolve_plan(&ctx.gateway.load().unwrap(), &ToolId::Claude, "", None).unwrap();
+    assert_eq!(plan.candidates[0].relay.id, "deepseek");
+}
+
+#[test]
+fn selected_provider_survives_default_changes_and_rejects_later_conflicts() {
+    use codex_plus_core::gateway::route::{claude_alias, resolve_plan};
+
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    let mut first = binding();
+    first.model = "deepseek/deepseek-v4-pro[1M]".into();
+    first.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro[1M]".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    let saved = enable_binding(ctx, &ToolId::Codex, first).unwrap();
+    assert_eq!(
+        saved.binding(&ToolId::Codex).unwrap().default_model_selection.as_ref().unwrap().upstream_model,
+        "deepseek-v4-pro"
+    );
+    // 模拟从没有历史记录的 #2975 旧版本升级。
+    ctx.gateway.update(|gateway| {
+        let binding = gateway.bindings.get_mut("codex").unwrap();
+        binding.model_selections.clear();
+        binding.default_model_selection.as_mut().unwrap().upstream_model = "deepseek-v4-pro[1M]".into();
+        Ok(())
+    }).unwrap();
+    let old = ctx.gateway.load().unwrap();
+    assert_eq!(
+        resolve_plan(&old, &ToolId::Codex, "deepseek/deepseek-v4-pro", None).unwrap().candidates[0].upstream_model,
+        "deepseek-v4-pro"
+    );
+    let mut next = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
+    next.model = "mirror/deepseek-v4-pro".into();
+    next.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "mirror".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:mirror".into(),
+        provider_removed: false,
+    });
+    next.model_selections.clear(); // 界面传回的历史不能覆盖服务端记录。
+    enable_binding(ctx, &ToolId::Codex, next).unwrap();
+
+    let gateway = ctx.gateway.load().unwrap();
+    for requested in ["deepseek/deepseek-v4-pro", &claude_alias("deepseek/deepseek-v4-pro")] {
+        let plan = resolve_plan(&gateway, &ToolId::Codex, requested, None).unwrap();
+        assert_eq!(plan.candidates[0].relay.id, "deepseek");
+        assert_eq!(plan.candidates[0].upstream_model, "deepseek-v4-pro");
+    }
+    assert_eq!(
+        resolve_plan(&gateway, &ToolId::Codex, "", None).unwrap().candidates[0].relay.id,
+        "mirror"
+    );
+    let mut conflict = gateway.clone();
+    let mut other = conflict.providers[1].clone();
+    other.relay.id = "native".into();
+    other.relay.model = "deepseek/deepseek-v4-pro".into();
+    other.relay.model_list = other.relay.model.clone();
+    conflict.providers.push(other);
+    assert!(resolve_plan(&conflict, &ToolId::Codex, "deepseek/deepseek-v4-pro", None).is_err());
+    for change in ["disabled", "excluded", "source"] {
+        let mut changed = gateway.clone();
+        match change {
+            "disabled" => changed.providers[0].enabled = false,
+            "excluded" => changed.bindings.get_mut("codex").unwrap().pool_exclude.push("deepseek".into()),
+            _ => changed.providers[0].source = "extension:replacement".into(),
+        }
+        assert!(resolve_plan(&changed, &ToolId::Codex, "deepseek/deepseek-v4-pro", None).is_err(), "{change}");
+    }
+    let mut legacy_gateway = gateway.clone();
+    legacy_gateway.bindings.get_mut("codex").unwrap().unknown_model =
+        codex_plus_core::gateway::store::UnknownModelPolicy::Passthrough;
+    let legacy = resolve_plan(&legacy_gateway, &ToolId::Codex, "old/deepseek-v4-pro", None).unwrap();
+    assert_eq!(legacy.candidates.len(), 2, "未登记的旧限定名仍按原规则回退");
+}
+
+#[test]
+fn failed_config_write_keeps_previous_default_binding() {
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let before = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
+    let config_before = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+    let mut settings = ctx.settings.load().unwrap();
+    settings.relay_profiles_enabled = false;
+    ctx.settings.save(&settings).unwrap();
+    let mut next = before.clone();
+    next.model = "mirror/deepseek-v4-pro".into();
+    next.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "mirror".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:mirror".into(),
+        provider_removed: false,
+    });
+    assert!(enable_binding(ctx, &ToolId::Codex, next).is_err());
+    let after = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
+    assert_eq!(after, before);
+    assert_eq!(std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap(), config_before);
+}
+
+#[test]
+fn grok_backup_failure_retains_staged_identity_and_previous_default() {
+    use codex_plus_core::gateway::route::resolve_plan;
+
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    enable_binding(ctx, &ToolId::Grok, binding()).unwrap();
+    let before = ctx.gateway.load().unwrap().binding(&ToolId::Grok).unwrap().clone();
+    let config_path = ctx.grok_home.join("config.toml");
+    let live_before = "model = \"manual\"\n";
+    std::fs::write(&config_path, live_before).unwrap();
+
+    let mut broken_ctx = ctx.clone();
+    broken_ctx.backup_root = fixture._temp.path().join("backup-is-a-file");
+    std::fs::write(&broken_ctx.backup_root, "not a directory").unwrap();
+    let selection = DefaultModelSelection {
+        provider_id: "mirror".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:mirror".into(),
+        provider_removed: false,
+    };
+    let mut next = before.clone();
+    next.model = "mirror/deepseek-v4-pro".into();
+    next.default_model_selection = Some(selection.clone());
+    let error = enable_binding(&broken_ctx, &ToolId::Grok, next).unwrap_err();
+    assert!(format!("{error:#}").contains("无法创建目录"), "{error:#}");
+    assert!(
+        error.chain().any(|cause| cause.downcast_ref::<std::io::Error>().is_some()),
+        "{error:#}"
+    );
+
+    let gateway = ctx.gateway.load().unwrap();
+    let mut expected = before;
+    expected.model_selections.push(selection);
+    assert_eq!(gateway.binding(&ToolId::Grok).unwrap(), &expected);
+    assert_eq!(std::fs::read_to_string(&config_path).unwrap(), live_before);
+    assert!(
+        codex_plus_core::gateway::server::exposed_models(&gateway, &ToolId::Grok)
+            .iter()
+            .any(|model| model == "mirror/deepseek-v4-pro")
+    );
+    assert_eq!(
+        resolve_plan(&gateway, &ToolId::Grok, "mirror/deepseek-v4-pro", None)
+            .unwrap()
+            .candidates[0]
+            .relay
+            .id,
+        "mirror"
+    );
+}
+
+#[test]
+fn concurrent_model_saves_keep_client_config_and_binding_in_sync() {
+    use std::sync::{Arc, Barrier};
+
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let start = Arc::new(Barrier::new(3));
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for (id, source) in [("deepseek", "preset:deepseek"), ("mirror", "preset:mirror")] {
+            let start = Arc::clone(&start);
+            let ctx = ctx.clone();
+            workers.push(scope.spawn(move || {
+                let mut selected = binding();
+                selected.model = format!("{id}/deepseek-v4-pro");
+                selected.default_model_selection = Some(DefaultModelSelection {
+                    provider_id: id.into(),
+                    upstream_model: "deepseek-v4-pro".into(),
+                    provider_source: source.into(),
+                    provider_removed: false,
+                });
+                start.wait();
+                enable_binding(&ctx, &ToolId::Codex, selected).unwrap();
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    });
+    let gateway = ctx.gateway.load().unwrap();
+    let saved = gateway.binding(&ToolId::Codex).unwrap();
+    let config: toml::Value =
+        toml::from_str(&std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap()).unwrap();
+    assert_eq!(config["model"].as_str(), Some(saved.model.as_str()));
+    assert!(saved.selection_for("deepseek/deepseek-v4-pro").is_some());
+    assert!(saved.selection_for("mirror/deepseek-v4-pro").is_some());
+}
+
+#[test]
+fn deleting_provider_clears_its_selections_and_allows_id_reuse() {
+    use codex_plus_core::gateway::route::resolve_plan;
+
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    let mut selected = binding();
+    selected.model = "mirror/deepseek-v4-pro".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "mirror".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:mirror".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Codex, selected.clone()).unwrap();
+    selected.model = "deepseek/deepseek-v4-pro[1M]".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Codex, selected).unwrap();
+    let after_delete = delete_provider(&ctx.gateway, "deepseek").unwrap();
+    let binding = after_delete.binding(&ToolId::Codex).unwrap();
+    assert!(binding.model.is_empty());
+    assert!(binding.default_model_selection.is_none());
+    assert_eq!(binding.model_selections.len(), 1);
+    assert_eq!(binding.model_selections[0].provider_id, "mirror");
+    assert_eq!(resolve_plan(&after_delete, &ToolId::Codex, "", None).unwrap().candidates[0].relay.id, "mirror");
+    refresh_enabled(ctx).unwrap();
+
+    ctx.gateway.update(|gateway| {
+        let mirror = gateway.providers.iter_mut().find(|provider| provider.relay.id == "mirror").unwrap();
+        codex_plus_core::relay_config::set_relay_profile_model(&mut mirror.relay, "mirror/deepseek-v4-pro")?;
+        mirror.relay.model_list = "mirror/deepseek-v4-pro".into();
+        Ok(())
+    }).unwrap();
+    refresh_enabled(ctx).unwrap();
+    let gateway = ctx.gateway.load().unwrap();
+    for model in ["", "unknown"] {
+        let plan = resolve_plan(&gateway, &ToolId::Codex, model, None).unwrap();
+        assert_eq!(plan.candidates[0].relay.id, "mirror");
+        assert_eq!(plan.candidates[0].upstream_model, "mirror/deepseek-v4-pro");
+    }
+    assert!(resolve_plan(&gateway, &ToolId::Codex, "mirror/deepseek-v4-pro", None).is_err());
+    ctx.gateway.update(|gateway| {
+        let mirror = gateway.providers.iter_mut().find(|provider| provider.relay.id == "mirror").unwrap();
+        codex_plus_core::relay_config::set_relay_profile_model(&mut mirror.relay, "deepseek-v4-pro")?;
+        mirror.relay.model_list = "deepseek-v4-pro\ndeepseek-v4-flash".into();
+        Ok(())
+    }).unwrap();
+
+    let (recreated, id) = create_provider(&ctx.gateway, &deepseek_input(), "preset:deepseek", None).unwrap();
+    assert_eq!(id, "deepseek");
+    assert_eq!(
+        resolve_plan(&recreated, &ToolId::Codex, "deepseek/deepseek-v4-pro", None)
+            .unwrap().candidates[0].relay.id,
+        "deepseek",
+        "相同 ID 重建后，旧字符串无法区分新旧供应商"
+    );
+}
+
+#[test]
+fn resetting_model_selections_preserves_current_default_and_allows_new_history() {
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput { name: "Mirror".into(), ..deepseek_input() },
+        "preset:mirror",
+        None,
+    ).unwrap();
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Codex, selected.clone()).unwrap();
+    let previous = selected.clone();
+    selected.model = "mirror/deepseek-v4-pro".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "mirror".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:mirror".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Codex, selected).unwrap();
+    let reset = reset_model_selections(&ctx.gateway, &ToolId::Codex).unwrap();
+    let binding = reset.binding(&ToolId::Codex).unwrap();
+    assert!(binding.model_selections.is_empty());
+    assert!(binding.selection_for("mirror/deepseek-v4-pro").is_some());
+    assert!(binding.selection_for("deepseek/deepseek-v4-pro").is_none());
+    let saved = enable_binding(ctx, &ToolId::Codex, previous).unwrap();
+    let binding = saved.binding(&ToolId::Codex).unwrap();
+    assert!(binding.selection_for("deepseek/deepseek-v4-pro").is_some());
+    assert!(binding.selection_for("mirror/deepseek-v4-pro").is_some());
+
+    ctx.gateway.update(|gateway| {
+        gateway.bindings.get_mut("codex").unwrap().default_model_selection.as_mut().unwrap().provider_removed = true;
+        Ok(())
+    }).unwrap();
+    let reset = reset_model_selections(&ctx.gateway, &ToolId::Codex).unwrap();
+    let binding = reset.binding(&ToolId::Codex).unwrap();
+    assert!(binding.model.is_empty());
+    assert!(binding.default_model_selection.is_none());
+    assert!(binding.model_selections.is_empty());
+}
+
+#[test]
+fn resetting_an_invalid_default_allows_reselecting_the_changed_provider() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Codex, selected).unwrap();
+    ctx.gateway.update(|gateway| {
+        gateway.providers[0].source = "extension:replacement".into();
+        Ok(())
+    }).unwrap();
+
+    let mut replacement = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
+    replacement.default_model_selection.as_mut().unwrap().provider_source = "extension:replacement".into();
+    let error = enable_binding(ctx, &ToolId::Codex, replacement.clone()).unwrap_err();
+    assert!(error.to_string().contains("重置历史模型选择"), "{error:#}");
+    let reset = reset_model_selections(&ctx.gateway, &ToolId::Codex).unwrap();
+    let binding = reset.binding(&ToolId::Codex).unwrap();
+    assert!(binding.model.is_empty());
+    assert!(binding.default_model_selection.is_none());
+    assert!(binding.model_selections.is_empty());
+    let saved = enable_binding(ctx, &ToolId::Codex, replacement).unwrap();
+    assert_eq!(
+        saved.binding(&ToolId::Codex).unwrap().default_model_selection.as_ref().unwrap().provider_source,
+        "extension:replacement"
+    );
+}
+
+#[test]
+fn resetting_history_checks_the_current_selection_after_clearing_history() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    let mut stale = selected.default_model_selection.clone().unwrap();
+    stale.provider_source = "extension:old".into();
+    selected.model_selections.push(stale);
+    ctx.gateway.update(|gateway| {
+        gateway.bindings.insert("codex".into(), selected.clone());
+        Ok(())
+    }).unwrap();
+    let reset = reset_model_selections(&ctx.gateway, &ToolId::Codex).unwrap();
+    let binding = reset.binding(&ToolId::Codex).unwrap();
+    assert!(binding.model_selections.is_empty());
+    assert_eq!(binding.model, "deepseek/deepseek-v4-pro");
+    assert_eq!(binding.default_model_selection, selected.default_model_selection);
+}
+
+#[test]
+fn invalid_default_without_fallback_leaves_agent_config_unchanged() {
+    use codex_plus_core::gateway::route::{preview_plan, resolve_plan};
+
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57394);
+    let ctx = &fixture.ctx;
+    let mut selected = binding();
+    selected.model = "deepseek/deepseek-v4-pro".into();
+    selected.default_model_selection = Some(DefaultModelSelection {
+        provider_id: "deepseek".into(),
+        upstream_model: "deepseek-v4-pro".into(),
+        provider_source: "preset:deepseek".into(),
+        provider_removed: false,
+    });
+    enable_binding(ctx, &ToolId::Claude, selected).unwrap();
+    let before = std::fs::read(ctx.claude.claude_home.join("settings.json")).unwrap();
+    ctx.gateway.update(|gateway| {
+        gateway.providers[0].source = "extension:replacement".into();
+        codex_plus_core::relay_config::set_relay_profile_model(&mut gateway.providers[0].relay, "")?;
+        gateway.providers[0].relay.model_list.clear();
+        Ok(())
+    }).unwrap();
+    assert!(refresh_enabled(ctx).is_err());
+    assert_eq!(std::fs::read(ctx.claude.claude_home.join("settings.json")).unwrap(), before);
+    let gateway = ctx.gateway.load().unwrap();
+    for plan in [resolve_plan, preview_plan] {
+        for requested in ["", "unknown", "deepseek/deepseek-v4-pro"] {
+            assert!(plan(&gateway, &ToolId::Claude, requested, None).is_err(), "{requested}");
+        }
+    }
+}
+
+#[test]
+fn selected_provider_default_falls_back_on_a_real_extension_override() {
+    use codex_plus_core::gateway::route::{preview_plan, resolve_plan};
+    use codex_plus_core::gateway::store::UnknownModelPolicy;
+    use codex_plus_core::user_scripts::UserScriptManager;
+
+    let fixture = fixture(57394);
+    let mut gateway = fixture.ctx.gateway.load().unwrap();
+    let mut selected = serde_json::to_value(binding()).unwrap();
+    selected["enabled"] = json!(true);
+    selected["model"] = json!("deepseek/deepseek-v4-pro");
+    selected["defaultModelSelection"] = json!({
+        "providerId": "deepseek",
+        "upstreamModel": "deepseek-v4-pro",
+        "providerSource": "preset:deepseek"
+    });
+    gateway.bindings.insert("codex".into(), serde_json::from_value(selected).unwrap());
+    assert!(resolve_plan(&gateway, &ToolId::Codex, "", None).is_ok());
+
+    let temp = tempfile::tempdir().unwrap();
+    let package = temp.path().join("user/swap");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("codexpp.json"), json!({
+        "id": "swap",
+        "name": "swap",
+        "providers": [{
+            "id": "deepseek",
+            "baseUrl": "http://127.0.0.1:9000/v1",
+            "models": ["deepseek-v4-pro"],
+            "override": true
+        }]
+    }).to_string()).unwrap();
+    let manager = UserScriptManager::new(
+        temp.path().join("builtin"),
+        temp.path().join("user"),
+        temp.path().join("user_scripts.json"),
+    );
+    let mut overridden = gateway.clone().with_extension_providers_from(&manager);
+    assert_eq!(overridden.provider("deepseek").unwrap().source, "extension:swap");
+    for policy in [UnknownModelPolicy::MapToDefault, UnknownModelPolicy::Passthrough] {
+        overridden.bindings.get_mut("codex").unwrap().unknown_model = policy;
+        for plan in [resolve_plan, preview_plan] {
+            for requested in ["", "unknown"] {
+                let fallback = plan(&overridden, &ToolId::Codex, requested, None).unwrap();
+                assert_eq!(fallback.candidates[0].relay.id, "deepseek");
+                let expected = if requested == "unknown" && policy == UnknownModelPolicy::Passthrough {
+                    "unknown"
+                } else {
+                    "deepseek-v4-pro"
+                };
+                assert_eq!(fallback.candidates[0].upstream_model, expected);
+            }
+            let error = plan(&overridden, &ToolId::Codex, "deepseek/deepseek-v4-pro", None)
+                .expect_err("拓展覆盖不能静默继承本地供应商的选择");
+            assert!(error.to_string().contains("来源已变化"), "{error:#}");
+        }
+    }
+    assert_eq!(
+        resolve_plan(&gateway, &ToolId::Codex, "", None).unwrap().candidates[0].upstream_model,
+        "deepseek-v4-pro"
+    );
+}
+
+#[test]
+fn codex_rejects_unwritable_pinned_default_without_changing_existing_config() {
+    let control = fixture(57393);
+    let original = "m".repeat(248);
+    std::fs::create_dir_all(&control.ctx.codex_home).unwrap();
+    control
+        .ctx
+        .gateway
+        .update(|gateway| {
+            gateway.providers[0].relay.model = original.clone();
+            gateway.providers[0].relay.model_list = original.clone();
+            Ok(())
+        })
+        .unwrap();
+    let mut bare = binding();
+    bare.model = original.clone();
+    enable_binding(&control.ctx, &ToolId::Codex, bare).unwrap();
+    let config = std::fs::read_to_string(control.ctx.codex_home.join("config.toml")).unwrap();
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(
+        parsed.get("model").and_then(toml::Value::as_str),
+        Some(original.as_str())
+    );
+
+    let mut selected = binding();
+    selected.model = format!("deepseek/{original}");
+    let error = enable_binding(&control.ctx, &ToolId::Codex, selected).unwrap_err();
+    assert!(error.to_string().contains("默认模型无法写入 Codex 配置"));
+    assert_eq!(
+        std::fs::read_to_string(control.ctx.codex_home.join("config.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        control
+            .ctx
+            .gateway
+            .load()
+            .unwrap()
+            .binding(&ToolId::Codex)
+            .unwrap()
+            .model,
+        original
+    );
+}
+
+#[test]
+fn codex_accepts_writable_pinned_defaults_at_the_byte_boundary() {
+    for original in ["m".repeat(247), "界".repeat(82)] {
+        let fixture = fixture(57394);
+        std::fs::create_dir_all(&fixture.ctx.codex_home).unwrap();
+        fixture
+            .ctx
+            .gateway
+            .update(|gateway| {
+                gateway.providers[0].relay.model = original.clone();
+                gateway.providers[0].relay.model_list = original.clone();
+                Ok(())
+            })
+            .unwrap();
+        let mut selected = binding();
+        selected.model = format!("deepseek/{original}");
+        assert!(selected.model.len() <= 256);
+        enable_binding(&fixture.ctx, &ToolId::Codex, selected.clone()).unwrap();
+        let config = std::fs::read_to_string(fixture.ctx.codex_home.join("config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&config).unwrap();
+        assert_eq!(
+            config.get("model").and_then(toml::Value::as_str),
+            Some(selected.model.as_str())
+        );
+    }
+}
+
+#[test]
+fn codex_rejects_a_pinned_default_with_an_unwritable_provider_id() {
+    let fixture = fixture(57394);
+    fixture
+        .ctx
+        .gateway
+        .update(|gateway| {
+            gateway.providers[0].relay.id = "deep\\seek".into();
+            Ok(())
+        })
+        .unwrap();
+    let mut selected = binding();
+    selected.model = "deep\\seek/deepseek-v4-pro".into();
+    let error = enable_binding(&fixture.ctx, &ToolId::Codex, selected).unwrap_err();
+    assert!(error.to_string().contains("默认模型无法写入 Codex 配置"));
+    assert!(!fixture.ctx.codex_home.join("config.toml").exists());
+    assert!(
+        fixture
+            .ctx
+            .gateway
+            .load()
+            .unwrap()
+            .binding(&ToolId::Codex)
+            .is_none()
+    );
+}
+
 /// 网关模式给 Codex 的模型目录与直连模式的按模型聚合一样：显示名、推理档位、按供应商分组，
 /// 模型组单独一组。没有内置元数据的模型（第三方的 claude-*）也要有推理档位。
 #[test]
@@ -851,6 +1999,8 @@ fn codex_gateway_endpoint_returns_to_loopback_outside_wsl() {
     seeded.relay_profiles_enabled = true;
     ctx.settings.save(&seeded).unwrap();
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let initial_generation =
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
     let loopback = "127.0.0.1:57398/gw/codex/v1";
     let config_path = ctx.codex_home.join("config.toml");
     assert!(
@@ -881,6 +2031,10 @@ fn codex_gateway_endpoint_returns_to_loopback_outside_wsl() {
     );
 
     assert!(sync_codex_wsl_endpoint(ctx).unwrap());
+    assert_ne!(
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(),
+        initial_generation
+    );
     let config = std::fs::read_to_string(&config_path).unwrap();
     assert!(config.contains(loopback), "{config}");
     assert!(!config.contains("172.29.16.1"), "{config}");
@@ -933,6 +2087,8 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
     .unwrap();
 
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let initial_generation =
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
     let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
     assert!(config.contains("model_provider = \"openai\""), "{config}");
     assert!(config.contains("openai_base_url"), "{config}");
@@ -963,6 +2119,10 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
     )
     .unwrap();
     assert!(codex_plus_core::gateway::apply::sync_codex_identity(ctx).unwrap());
+    assert_ne!(
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(),
+        initial_generation
+    );
     assert_eq!(
         ctx.settings.load().unwrap().active_relay_session_provider(),
         codex_plus_core::settings::RelaySessionProvider::Custom
@@ -973,6 +2133,292 @@ fn signed_in_codex_keeps_its_chatgpt_identity_through_the_gateway() {
     let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
     assert!(!config.contains("/gw/codex"), "{config}");
     assert_eq!(ctx.settings.load().unwrap().active_relay_id, "direct");
+}
+
+fn seed_unsigned_managed_codex(ctx: &ApplyContext) {
+    let settings = BackendSettings {
+        relay_profiles_enabled: true,
+        active_relay_id: "direct".into(),
+        relay_profiles: vec![direct_relay("direct", "fixture-model")],
+        ..Default::default()
+    };
+    codex_plus_core::relay_switch::switch_relay_profile_in_home(
+        &ctx.settings, &ctx.codex_home, settings, "",
+    ).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    assert_eq!(
+        ctx.settings.load().unwrap().active_relay_session_provider(),
+        codex_plus_core::settings::RelaySessionProvider::Custom,
+    );
+}
+
+fn selected_login(account: &str) -> String {
+    use base64::Engine;
+    let id_token = format!("e30.{}.fixture", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        json!({"sub": format!("fixture-user-{account}"),
+            "https://api.openai.com/auth": {"chatgpt_account_id": account}}).to_string(),
+    ));
+    json!({
+        "auth_mode":"chatgpt", "codex_plus_gateway":true,
+        "tokens":{"id_token":id_token, "access_token":format!("fixture-{account}"),
+            "refresh_token":format!("fixture-refresh-{account}"), "account_id":account}
+    }).to_string()
+}
+
+#[test]
+fn explicit_native_selection_updates_managed_session_identity_without_changing_gateway_route() {
+    use codex_plus_core::gateway::apply::sync_codex_identity_after_selection;
+    use codex_plus_core::settings::{NativeAuthSelection, RelaySessionProvider};
+    let fixture = fixture(29557);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    for account in ["account-a", "account-b"] {
+        let mut settings = ctx.settings.load().unwrap();
+        settings.native_auth_selection = Some(NativeAuthSelection::Account { account_ref: account.into() });
+        ctx.settings.save(&settings).unwrap();
+        std::fs::write(ctx.codex_home.join("auth.json"), selected_login(account)).unwrap();
+        let previous_generation = codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
+        sync_codex_identity_after_selection(ctx).unwrap();
+        assert_ne!(codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(), previous_generation);
+        let settings = ctx.settings.load().unwrap();
+        assert_eq!(settings.active_relay_session_provider(), RelaySessionProvider::Openai);
+        let config = std::fs::read_to_string(ctx.codex_home.join("config.toml")).unwrap();
+        assert!(config.contains("model_provider = \"openai\""));
+        assert!(config.contains("http://127.0.0.1:29557/gw/codex/v1"));
+        assert_eq!(codex_plus_core::gateway::drift::check(ctx, &ToolId::Codex), None);
+        let auth: Value = serde_json::from_str(
+            &std::fs::read_to_string(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"]["account_id"], account);
+    }
+}
+
+#[test]
+fn explicitly_selected_disabled_subscription_is_not_stripped_as_a_stale_lent_login() {
+    use codex_plus_core::gateway::apply::{add_provider, sync_codex_identity};
+    use codex_plus_core::settings::{NativeAuthSelection, RelaySessionProvider};
+    let fixture = fixture(29558);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let auth = selected_login("saved-disabled");
+    let (_, id) = add_provider(&ctx.gateway, RelayProfile {
+        name: "Saved disabled account".into(), relay_mode: RelayMode::Official,
+        auth_contents: auth.clone(), ..Default::default()
+    }, "login:chatgpt", None).unwrap();
+    set_provider_enabled(&ctx.gateway, &id, false).unwrap();
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::Account { account_ref: id });
+    ctx.settings.save(&settings).unwrap();
+    std::fs::write(ctx.codex_home.join("auth.json"), auth).unwrap();
+    assert!(sync_codex_identity(ctx).unwrap());
+    assert_eq!(ctx.settings.load().unwrap().active_relay_session_provider(), RelaySessionProvider::Openai);
+    let auth: Value = serde_json::from_str(
+        &std::fs::read_to_string(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"]["account_id"], "saved-disabled");
+}
+
+#[test]
+fn native_selection_does_not_reconnect_a_disabled_or_taken_over_gateway() {
+    use codex_plus_core::gateway::{apply::sync_codex_identity_after_selection, connection_generation};
+    let fixture = fixture(29560);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let initial = connection_generation::read(&ctx.codex_home).unwrap();
+    ctx.gateway.update(|gateway| {
+        gateway.bindings.get_mut("codex").unwrap().enabled = false;
+        Ok(())
+    }).unwrap();
+    sync_codex_identity_after_selection(ctx).unwrap();
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), initial);
+    ctx.gateway.update(|gateway| {
+        gateway.bindings.get_mut("codex").unwrap().enabled = true;
+        Ok(())
+    }).unwrap();
+    std::fs::write(ctx.codex_home.join("config.toml"),
+        "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://other.example/v1\"\n").unwrap();
+    sync_codex_identity_after_selection(ctx).unwrap();
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), initial);
+}
+
+#[test]
+fn native_login_after_explicit_sign_out_is_kept_when_synchronizing_gateway_identity() {
+    use codex_plus_core::gateway::apply::sync_codex_identity;
+    use codex_plus_core::settings::{NativeAuthSelection, RelaySessionProvider};
+    let fixture = fixture(29559);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::None);
+    ctx.settings.save(&settings).unwrap();
+    let mut login: Value = serde_json::from_str(&selected_login("new-native-account")).unwrap();
+    login["OPENAI_API_KEY"] = json!("fixture-api-key");
+    login["last_refresh"] = json!("2026-11-14T00:00:00Z");
+    login["external-field"] = json!({"preserved": true});
+    std::fs::write(ctx.codex_home.join("auth.json"), login.to_string()).unwrap();
+    assert!(sync_codex_identity(ctx).unwrap());
+    let settings = ctx.settings.load().unwrap();
+    assert_eq!(settings.active_relay_session_provider(), RelaySessionProvider::Openai);
+    assert!(settings.native_auth_selection.is_none());
+    let auth: Value = serde_json::from_str(
+        &std::fs::read_to_string(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"], login["tokens"]);
+    assert_eq!(auth["auth_mode"], "chatgpt");
+    assert_eq!(auth["last_refresh"], login["last_refresh"]);
+    assert_eq!(auth["external-field"], login["external-field"]);
+    assert!(auth["OPENAI_API_KEY"].as_str().is_some_and(|key| key.starts_with("cpx-gw-codex-")));
+    let applied_auth = std::fs::read(ctx.codex_home.join("auth.json")).unwrap();
+    assert!(!sync_codex_identity(ctx).unwrap());
+    assert_eq!(std::fs::read(ctx.codex_home.join("auth.json")).unwrap(), applied_auth);
+}
+
+#[test]
+fn native_login_clears_old_sign_out_choice_even_when_the_connection_already_matches() {
+    use codex_plus_core::gateway::{apply::sync_codex_identity, connection_generation};
+    use codex_plus_core::settings::NativeAuthSelection;
+    let fixture = fixture(29561);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let login = selected_login("new-native-account");
+    std::fs::write(ctx.codex_home.join("auth.json"), &login).unwrap();
+    assert!(sync_codex_identity(ctx).unwrap());
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::None);
+    ctx.settings.save(&settings).unwrap();
+    let config = std::fs::read(ctx.codex_home.join("config.toml")).unwrap();
+    let auth = std::fs::read(ctx.codex_home.join("auth.json")).unwrap();
+    let generation = connection_generation::read(&ctx.codex_home).unwrap();
+    assert!(!sync_codex_identity(ctx).unwrap());
+    assert!(ctx.settings.load().unwrap().native_auth_selection.is_none());
+    assert_eq!(std::fs::read(ctx.codex_home.join("auth.json")).unwrap(), auth);
+    assert_eq!(std::fs::read(ctx.codex_home.join("config.toml")).unwrap(), config);
+    assert_eq!(connection_generation::read(&ctx.codex_home).unwrap(), generation);
+}
+
+#[test]
+fn gateway_reapplication_respects_a_native_login_after_explicit_sign_out() {
+    use codex_plus_core::settings::{NativeAuthSelection, RelaySessionProvider};
+    let fixture = fixture(29562);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::None);
+    ctx.settings.save(&settings).unwrap();
+    let login = selected_login("native-reapplication");
+    std::fs::write(ctx.codex_home.join("auth.json"), &login).unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let settings = ctx.settings.load().unwrap();
+    assert!(settings.native_auth_selection.is_none());
+    assert_eq!(settings.active_relay_session_provider(), RelaySessionProvider::Openai);
+    let auth: Value = serde_json::from_slice(&std::fs::read(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"], serde_json::from_str::<Value>(&login).unwrap()["tokens"]);
+}
+
+#[test]
+fn explicit_sign_out_without_live_login_does_not_borrow_an_available_pool_account() {
+    use codex_plus_core::gateway::apply::{add_provider, sync_codex_identity};
+    use codex_plus_core::settings::{NativeAuthSelection, RelaySessionProvider};
+    let fixture = fixture(29563);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    add_provider(&ctx.gateway, RelayProfile {
+        name: "Available saved login".into(), relay_mode: RelayMode::Official,
+        auth_contents: selected_login("saved-pool-account"), ..Default::default()
+    }, "login:chatgpt", None).unwrap();
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::None);
+    ctx.settings.save(&settings).unwrap();
+    for live in [r#"{"OPENAI_API_KEY":"fixture-key"}"#,
+        r#"{"OPENAI_API_KEY":"fixture-key","tokens":{"access_token":"  "}}"#] {
+        std::fs::write(ctx.codex_home.join("auth.json"), live).unwrap();
+        sync_codex_identity(ctx).unwrap();
+        enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+        let settings = ctx.settings.load().unwrap();
+        assert_eq!(settings.native_auth_selection, Some(NativeAuthSelection::None));
+        assert_eq!(settings.active_relay_session_provider(), RelaySessionProvider::Custom);
+        let auth: Value = serde_json::from_slice(&std::fs::read(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+        assert!(auth.get("tokens").is_none());
+    }
+}
+
+#[test]
+fn native_relogin_to_a_disabled_pool_account_survives_refresh_and_new_loans_still_return() {
+    use codex_plus_core::gateway::apply::{add_provider, sync_codex_identity};
+    use codex_plus_core::settings::NativeAuthSelection;
+    let fixture = fixture(29564);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let stored = selected_login("shared-account");
+    let (_, id) = add_provider(&ctx.gateway, RelayProfile {
+        name: "Saved login".into(), relay_mode: RelayMode::Official,
+        auth_contents: stored.clone(), ..Default::default()
+    }, "login:chatgpt", None).unwrap();
+    ctx.gateway.update(|gateway| {
+        let provider = gateway.providers.iter_mut().find(|p| p.relay.id == id).unwrap();
+        let mut auth: Value = serde_json::from_str(&provider.relay.auth_contents)?;
+        auth[codex_plus_core::official_login::LENT_TO_CODEX_MARKER] = json!(true);
+        provider.relay.auth_contents = auth.to_string();
+        provider.enabled = false;
+        Ok(())
+    }).unwrap();
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::None);
+    ctx.settings.save(&settings).unwrap();
+    let mut native: Value = serde_json::from_str(&stored).unwrap();
+    native["tokens"]["access_token"] = json!("new-native-access");
+    native["tokens"]["refresh_token"] = json!("new-native-refresh");
+    std::fs::write(ctx.codex_home.join("auth.json"), native.to_string()).unwrap();
+    sync_codex_identity(ctx).unwrap();
+    assert!(ctx.settings.load().unwrap().native_auth_selection.is_none());
+    let gateway = ctx.gateway.load().unwrap();
+    assert!(!codex_plus_core::official_login::is_lent_to_codex(&gateway.provider(&id).unwrap().relay));
+    let pool_auth: Value = serde_json::from_str(&gateway.provider(&id).unwrap().relay.auth_contents).unwrap();
+    assert_eq!(pool_auth["tokens"], serde_json::from_str::<Value>(&stored).unwrap()["tokens"]);
+    for _ in 0..2 {
+        refresh_enabled(ctx).unwrap();
+        enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+        let auth: Value = serde_json::from_slice(&std::fs::read(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"], native["tokens"]);
+    }
+    // 用户再退出后，下一次真正借出的登录仍由原有借用生命周期管理。
+    std::fs::write(ctx.codex_home.join("auth.json"), r#"{"OPENAI_API_KEY":"fixture"}"#).unwrap();
+    set_provider_enabled(&ctx.gateway, &id, true).unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(codex_plus_core::official_login::is_lent_to_codex(&ctx.gateway.load().unwrap().provider(&id).unwrap().relay));
+    set_provider_enabled(&ctx.gateway, &id, false).unwrap();
+    refresh_enabled(ctx).unwrap();
+    let auth: Value = serde_json::from_slice(&std::fs::read(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+    assert!(auth.get("tokens").is_none());
+}
+
+#[test]
+fn a_disabled_loan_in_the_same_workspace_does_not_own_another_users_native_login() {
+    use base64::Engine;
+    use codex_plus_core::gateway::apply::{add_provider, sync_codex_identity};
+    use codex_plus_core::settings::NativeAuthSelection;
+    let fixture = fixture(29565);
+    let ctx = &fixture.ctx;
+    seed_unsigned_managed_codex(ctx);
+    let mut stored: Value = serde_json::from_str(&selected_login("team-workspace")).unwrap();
+    stored[codex_plus_core::official_login::LENT_TO_CODEX_MARKER] = json!(true);
+    let (_, id) = add_provider(&ctx.gateway, RelayProfile {
+        name: "Other member".into(), relay_mode: RelayMode::Official,
+        auth_contents: stored.to_string(), ..Default::default()
+    }, "login:chatgpt", None).unwrap();
+    set_provider_enabled(&ctx.gateway, &id, false).unwrap();
+    let mut settings = ctx.settings.load().unwrap();
+    settings.native_auth_selection = Some(NativeAuthSelection::None);
+    ctx.settings.save(&settings).unwrap();
+    let mut native = stored;
+    native["tokens"]["id_token"] = json!(format!("e30.{}.fixture",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            json!({"sub":"different-native-user"}).to_string())));
+    native["tokens"]["access_token"] = json!("different-user-access");
+    native["tokens"]["refresh_token"] = json!("different-user-refresh");
+    std::fs::write(ctx.codex_home.join("auth.json"), native.to_string()).unwrap();
+    sync_codex_identity(ctx).unwrap();
+    refresh_enabled(ctx).unwrap();
+    let auth: Value = serde_json::from_slice(&std::fs::read(ctx.codex_home.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(auth["tokens"], native["tokens"]);
+    assert!(codex_plus_core::official_login::is_lent_to_codex(&ctx.gateway.load().unwrap().provider(&id).unwrap().relay));
 }
 
 /// Codex 自己没登录、池里有网关登录的 ChatGPT 账号：接入时借给 Codex 登录（官方身份），
@@ -1970,6 +3416,810 @@ fn codex_catalog(ctx: &ApplyContext) -> Value {
 }
 
 #[test]
+fn gateway_catalog_includes_declared_models_with_provider_metadata() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57389);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let id = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Other".into(),
+            model: "other-model".into(),
+            model_list: "other-model".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &id,
+        &json!({
+            "claude-opus-5-5": {
+                "display_name": "Private Claude",
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                "default_reasoning_level": "high",
+                "service_tiers": [{"id": "priority"}]
+            },
+            "unlisted-chat": {
+                "supported_reasoning_levels": [{"effort": "low"}],
+                "default_reasoning_level": "low"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Daily".into(),
+            members: vec![GroupMember {
+                model: format!("{id}/claude-opus-5-5"),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let declared = format!("{id}/claude-opus-5-5");
+    let alias = format!("{id}/deepseek-v4-flash");
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: format!("{declared}[96K]"),
+            extra_models: vec![
+                alias.clone(),
+                "DEEPSEEK-V4-FLASH".into(),
+                "group/DAILY".into(),
+                "unlisted-chat[64K]".into(),
+            ],
+            context_window: Some(128_000),
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let catalog = codex_catalog(ctx);
+    let models = catalog["models"].as_array().unwrap();
+    let entry = |slug: &str| {
+        models
+            .iter()
+            .find(|entry| entry["slug"] == slug)
+            .unwrap_or_else(|| panic!("目录里没有 {slug}：{catalog}"))
+    };
+    assert_eq!(models[0]["slug"], declared);
+    assert_eq!(entry(&declared)["codex_plus_group_id"], id);
+    assert_eq!(entry(&declared)["display_name"], "Private Claude");
+    assert_eq!(entry(&declared)["default_reasoning_level"], "high");
+    assert_eq!(entry(&declared)["service_tiers"][0]["id"], "priority");
+    assert_eq!(entry(&declared)["context_window"], 96_000);
+    assert_eq!(entry(&alias)["codex_plus_group_id"], id);
+    assert!(entry("unlisted-chat")["codex_plus_group_id"].is_null());
+    assert_eq!(entry("unlisted-chat")["default_reasoning_level"], "low");
+    assert_eq!(entry("unlisted-chat")["context_window"], 64_000);
+    assert_eq!(entry("group/daily")["display_name"], "Daily");
+    assert_eq!(entry("group/daily")["default_reasoning_level"], "high");
+    assert_eq!(
+        models
+            .iter()
+            .filter(|entry| {
+                entry["slug"]
+                    .as_str()
+                    .unwrap()
+                    .eq_ignore_ascii_case("deepseek-v4-flash")
+            })
+            .count(),
+        1
+    );
+    let groups: Vec<&str> = models
+        .iter()
+        .filter_map(|entry| entry["codex_plus_group_id"].as_str())
+        .collect();
+    let mut blocks = groups.clone();
+    blocks.dedup();
+    let unique: std::collections::HashSet<_> = groups.into_iter().collect();
+    assert_eq!(blocks.len(), unique.len(), "同一供应商的模型不能分成几块");
+    let gateway = ctx.gateway.load().unwrap();
+    let binding = gateway.binding(&ToolId::Codex).unwrap();
+    let expected: Vec<_> = codex_plus_core::gateway::route::codex_binding_models(&gateway, binding);
+    assert_eq!(
+        codex_plus_core::gateway::server::exposed_models(&gateway, &ToolId::Codex),
+        expected
+    );
+}
+
+#[test]
+fn gateway_declared_fallback_keeps_member_search_tool_restrictions() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57386);
+    let ctx = &fixture.ctx;
+    let first = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, second) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Kimi".into(),
+            base_url: "https://api.moonshot.cn/v1".into(),
+            protocol: RelayProtocol::Responses,
+            model: "kimi-k3".into(),
+            model_list: "kimi-k3".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Fallback".into(),
+            members: vec![
+                GroupMember {
+                    model: format!("{first}/deepseek-v4-pro"),
+                    weight: 1,
+                },
+                GroupMember {
+                    model: format!("{second}/kimi-k3"),
+                    weight: 1,
+                },
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let gateway = ctx.gateway.load().unwrap();
+    let profile = codex_plus_core::gateway::apply::codex_gateway_profile(
+        &gateway,
+        &AgentBinding {
+            model: format!("group/{group}"),
+            extra_models: vec!["unlisted-chat".into()],
+            token: "test-gateway-catalog-token".into(),
+            ..AgentBinding::default()
+        },
+        ctx.port,
+        false,
+    )
+    .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    assert!(metadata["unlisted-chat"]["codex_plus_group_id"].is_null());
+    assert!(metadata["unlisted-chat"]["codex_plus_group"].is_null());
+    assert_eq!(metadata["unlisted-chat"]["supports_search_tool"], false);
+}
+
+#[test]
+fn gateway_declared_fallback_keeps_model_capability_restrictions() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57380);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let first = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, second) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Other".into(),
+            model: "other-model".into(),
+            model_list: "other-model".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &first,
+        &json!({
+            "unlisted-chat": {"supports_search_tool": true, "input_modalities": ["text", "image"]},
+            "restricted-chat": {"supports_search_tool": false, "input_modalities": ["text"]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &second,
+        &json!({
+            "unlisted-chat": {"supports_search_tool": false, "input_modalities": ["text"]},
+            "restricted-chat": {"supports_search_tool": true, "input_modalities": ["text", "image"]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Fallback".into(),
+            members: vec![
+                GroupMember { model: format!("{first}/deepseek-v4-pro"), weight: 1 },
+                GroupMember { model: format!("{second}/other-model"), weight: 1 },
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: format!("group/{group}"),
+            extra_models: vec!["unlisted-chat".into(), "restricted-chat".into()],
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let gateway = ctx.gateway.load().unwrap();
+    let binding = gateway.binding(&ToolId::Codex).unwrap();
+    assert_eq!(
+        codex_plus_core::gateway::route::model_entry_members(&gateway, binding, &format!("group/{group}")).len(),
+        2
+    );
+    let catalog = codex_catalog(ctx);
+    for slug in ["unlisted-chat", "restricted-chat"] {
+        let entry = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["slug"] == slug)
+            .unwrap();
+        assert_eq!(entry["supports_search_tool"], false, "{entry}");
+        assert_eq!(entry["input_modalities"], json!(["text"]), "{entry}");
+        assert!(entry["codex_plus_group_id"].is_null(), "{entry}");
+        assert!(entry["codex_plus_group"].is_null(), "{entry}");
+    }
+}
+
+/// #3042：供应商池里声明的图片能力要一路带到 Codex 原生目录和注入层的 modelMetadata；
+/// 纯文本模型不能借通用模板宣称收图，多家共用的一项（自动组、模型组）取各家交集。
+#[test]
+fn gateway_catalog_forwards_declared_image_input_capability() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57404);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let deepseek = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, ark) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Ark".into(),
+            model: "ark-vision".into(),
+            model_list: "ark-vision\nark-text\ndeepseek-v4-pro".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    // DeepSeek 那家把内置标成纯文本的 deepseek-v4-flash 声明为收图；
+    // 方舟这家声明 ark-vision 收图、ark-text 纯文本，它的 deepseek-v4-pro 也收图。
+    set_provider_metadata(
+        &ctx.gateway,
+        &deepseek,
+        &json!({"deepseek-v4-flash": {"input_modalities": ["text", "image"]}}).to_string(),
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &ark,
+        &json!({
+            "ark-vision": {"input_modalities": ["text", "image"], "supports_image_detail_original": true},
+            "ark-text": {"input_modalities": ["text"], "supports_image_detail_original": false},
+            "deepseek-v4-pro": {"input_modalities": ["text", "image"]}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Mixed".into(),
+            members: vec![
+                GroupMember { model: format!("{ark}/ark-vision"), weight: 1 },
+                GroupMember { model: format!("{ark}/ark-text"), weight: 1 },
+            ],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+
+    let group_model = format!("group/{group}");
+    let ark_pro = format!("{ark}/deepseek-v4-pro");
+    let expected = [
+        ("ark-vision", json!(["text", "image"])),
+        ("ark-text", json!(["text"])),
+        ("deepseek-v4-flash", json!(["text", "image"])),
+        // 两家都有的裸名是自动切换入口：DeepSeek 内置纯文本，交集只剩 text。
+        ("deepseek-v4-pro", json!(["text"])),
+        (ark_pro.as_str(), json!(["text", "image"])),
+        (group_model.as_str(), json!(["text"])),
+    ];
+
+    let settings = ctx.settings.load().unwrap();
+    let profile = settings
+        .relay_profiles
+        .iter()
+        .find(|profile| profile.id == "codex-plus-gateway")
+        .unwrap();
+    let metadata: Value = serde_json::from_str(&profile.model_metadata).unwrap();
+    for (slug, modalities) in &expected {
+        assert_eq!(&metadata[*slug]["input_modalities"], modalities, "{slug}: {metadata}");
+    }
+    assert_eq!(metadata["ark-vision"]["supports_image_detail_original"], true);
+    assert_eq!(metadata["ark-text"]["supports_image_detail_original"], false);
+    // 模型组有一家不支持原图细节，整组就不支持。
+    assert_eq!(metadata[group_model.as_str()]["supports_image_detail_original"], false);
+
+    // 原生目录与注入层读的 modelMetadata（由目录条目经白名单生成）都要带上同一份声明。
+    let catalog = codex_catalog(ctx);
+    let models = catalog["models"].as_array().unwrap();
+    for (slug, modalities) in &expected {
+        let entry = models
+            .iter()
+            .find(|entry| entry["slug"] == *slug)
+            .unwrap_or_else(|| panic!("目录里缺少 {slug}"));
+        assert_eq!(&entry["input_modalities"], modalities, "{slug}: {entry}");
+        let ui = codex_plus_core::model_suffix::model_ui_metadata_with_override(slug, Some(entry))
+            .unwrap();
+        assert_eq!(&ui["inputModalities"], modalities, "{slug}: {ui}");
+        assert_eq!(&ui["input_modalities"], modalities, "{slug}: {ui}");
+    }
+}
+
+#[test]
+fn gateway_catalog_tracks_disabled_auto_groups_for_declared_and_default_models() {
+    use codex_plus_core::gateway::apply::set_auto_group_enabled;
+
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57381);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Other".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: "deepseek-v4-pro".into(),
+            extra_models: vec!["deepseek-v4-flash".into()],
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let check = |enabled: bool| {
+        let catalog = codex_catalog(ctx);
+        let gateway = ctx.gateway.load().unwrap();
+        let binding = gateway.binding(&ToolId::Codex).unwrap();
+        for slug in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+            let entry = catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["slug"] == slug)
+                .unwrap();
+            assert_eq!(
+                codex_plus_core::gateway::route::model_entry_members(&gateway, binding, slug).len(),
+                2
+            );
+            if enabled {
+                assert_eq!(entry["codex_plus_group"], "自动组");
+                assert_eq!(entry["codex_plus_group_id"], "codex-plus-gateway-auto");
+            } else {
+                assert!(entry["codex_plus_group"].is_null(), "{entry}");
+                assert!(entry["codex_plus_group_id"].is_null(), "{entry}");
+                assert!(!entry["display_name"].as_str().unwrap().contains("（自动）"));
+            }
+        }
+    };
+    check(true);
+    for slug in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+        set_auto_group_enabled(&ctx.gateway, slug, false).unwrap();
+    }
+    refresh_enabled(ctx).unwrap();
+    check(false);
+    for slug in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+        set_auto_group_enabled(&ctx.gateway, slug, true).unwrap();
+    }
+    refresh_enabled(ctx).unwrap();
+    check(true);
+    ctx.gateway.update(|gateway| {
+        gateway.auto_models = false;
+        Ok(())
+    }).unwrap();
+    refresh_enabled(ctx).unwrap();
+    check(false);
+}
+
+#[test]
+fn gateway_catalog_recognizes_uppercase_group_prefix() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57382);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Kimi".into(),
+            base_url: "https://api.moonshot.cn/v1".into(),
+            protocol: RelayProtocol::Responses,
+            model: "kimi-k3".into(),
+            model_list: "kimi-k3".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Daily".into(),
+            members: vec![GroupMember { model: "kimi-k3".into(), weight: 1 }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let slug = format!("GROUP/{}", group.to_ascii_uppercase());
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: slug.clone(),
+            ..AgentBinding::default()
+        },
+    )
+    .unwrap();
+    let catalog = codex_catalog(ctx);
+    let entry = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["slug"] == slug)
+        .unwrap();
+    assert_eq!(entry["display_name"], "Daily");
+    assert_eq!(entry["description"], "Daily · 模型组");
+    assert_eq!(entry["codex_plus_group_id"], "codex-plus-gateway-groups");
+    assert_eq!(entry["supports_search_tool"], false);
+}
+
+#[test]
+fn gateway_catalog_refresh_follows_model_sync_and_pool_changes() {
+    use codex_plus_core::gateway::model_sync::{set_provider_models, sync_upstream_models};
+
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57388);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let first = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, second) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Mirror".into(),
+            model_list: "deepseek-v4-pro\nmirror-only".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let entries = || codex_catalog(ctx)["models"].as_array().unwrap().clone();
+    assert!(
+        entries()
+            .iter()
+            .any(|entry| entry["codex_plus_group"] == "自动组")
+    );
+    sync_upstream_models(
+        &ctx.gateway,
+        &second,
+        &[
+            "deepseek-v4-pro".into(),
+            "mirror-only".into(),
+            "synced-model".into(),
+        ],
+    )
+    .unwrap();
+    set_provider_metadata(
+        &ctx.gateway,
+        &second,
+        &json!({
+            "synced-model": {
+                "supported_reasoning_levels": [{"effort": "low"}],
+                "default_reasoning_level": "low"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    set_provider_windows(
+        &ctx.gateway,
+        &second,
+        [("synced-model".into(), 96_000)].into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(refresh_enabled(ctx).unwrap(), 1);
+    let models = entries();
+    let synced = models
+        .iter()
+        .find(|entry| entry["slug"] == "synced-model")
+        .unwrap();
+    assert_eq!(synced["codex_plus_group_id"], second);
+    assert_eq!(synced["default_reasoning_level"], "low");
+    assert_eq!(synced["context_window"], 96_000);
+
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Synced".into(),
+            members: vec![GroupMember {
+                model: format!("{second}/synced-*"),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let models = entries();
+    let grouped = models
+        .iter()
+        .find(|entry| entry["slug"] == format!("group/{group}"))
+        .unwrap();
+    assert_eq!(grouped["display_name"], "Synced");
+    assert_eq!(grouped["default_reasoning_level"], "low");
+    assert_eq!(grouped["context_window"], 96_000);
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: group.clone(),
+            name: "Renamed".into(),
+            members: vec![GroupMember {
+                model: format!("{first}/deepseek-v4-flash"),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(
+        entries().iter().any(|entry| {
+            entry["slug"] == format!("group/{group}") && entry["display_name"] == "Renamed"
+        })
+    );
+    delete_group(&ctx.gateway, &group).unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(
+        !entries()
+            .iter()
+            .any(|entry| entry["slug"] == format!("group/{group}"))
+    );
+
+    set_provider_models(&ctx.gateway, &second, &["mirror-only".into()], None).unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(!entries().iter().any(|entry| entry["slug"] == "synced-model"));
+    assert!(
+        !entries()
+            .iter()
+            .any(|entry| entry["slug"] == format!("{second}/deepseek-v4-pro"))
+    );
+    assert!(entries().iter().any(|entry| entry["slug"] == "deepseek-v4-pro"));
+    set_provider_enabled(&ctx.gateway, &second, false).unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(!entries().iter().any(|entry| entry["slug"] == "mirror-only"));
+    set_provider_enabled(&ctx.gateway, &second, true).unwrap();
+    ctx.gateway
+        .update(|gateway| {
+            gateway
+                .bindings
+                .get_mut("codex")
+                .unwrap()
+                .pool_exclude
+                .push(second.clone());
+            Ok(())
+        })
+        .unwrap();
+    refresh_enabled(ctx).unwrap();
+    assert!(
+        !entries()
+            .iter()
+            .any(|entry| entry["codex_plus_group_id"] == second)
+    );
+}
+
+#[test]
+fn codex_gateway_directory_snapshot_matches_published_catalog_without_connection_settings() {
+    use codex_plus_core::gateway::apply::{codex_gateway_model_catalog, codex_gateway_profile};
+    use codex_plus_core::gateway::model_sync::set_provider_models;
+
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57389);
+    let ctx = &fixture.ctx;
+    let provider_id = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    set_provider_models(
+        &ctx.gateway,
+        &provider_id,
+        &["deepseek-v4-pro".into(), "new-model".into()],
+        None,
+    )
+    .unwrap();
+    let (_, group_id) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Shared models".into(),
+            members: vec![GroupMember {
+                model: format!("{provider_id}/new-model"),
+                weight: 1,
+            }],
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    let gateway = ctx.gateway.load().unwrap();
+    let mut binding = binding();
+    binding.token = "test-private-token".into();
+    let snapshot = codex_gateway_model_catalog(&gateway, &binding);
+    let profile = codex_gateway_profile(&gateway, &binding, ctx.port, false).unwrap();
+
+    let (normalized_models, windows) =
+        codex_plus_core::model_suffix::migrate_model_list_with_suffixes(&snapshot.model_list);
+    assert_eq!(normalized_models, profile.model_list);
+    assert_eq!(
+        serde_json::to_value(windows).unwrap(),
+        serde_json::from_str::<Value>(&profile.model_windows).unwrap()
+    );
+    assert_eq!(snapshot.model_metadata, profile.model_metadata);
+    assert!(snapshot.model_list.contains("new-model"));
+    assert!(snapshot.model_list.contains(&format!("group/{group_id}")));
+    assert!(!snapshot.model_list.contains(&binding.token));
+    assert!(!snapshot.model_metadata.contains(&binding.token));
+    assert!(!snapshot.model_metadata.contains("api.deepseek.test"));
+
+    binding.token = "rotated-test-token".into();
+    assert_eq!(snapshot, codex_gateway_model_catalog(&gateway, &binding));
+
+    set_provider_windows(
+        &ctx.gateway,
+        &provider_id,
+        [("new-model".into(), 96_000)].into(),
+        None,
+    )
+    .unwrap();
+    let updated = codex_gateway_model_catalog(&ctx.gateway.load().unwrap(), &binding);
+    let (_, updated_windows) =
+        codex_plus_core::model_suffix::migrate_model_list_with_suffixes(&updated.model_list);
+    assert_eq!(updated_windows.get("new-model").map(String::as_str), Some("96000"));
+    assert_ne!(snapshot, updated);
+}
+
+#[test]
+fn gateway_catalog_refresh_keeps_provider_models_when_group_hides_shared_member() {
+    let _state = crate::common::IsolatedTestState::new();
+    let fixture = fixture(57387);
+    let ctx = &fixture.ctx;
+    std::fs::create_dir_all(&ctx.codex_home).unwrap();
+    ctx.settings
+        .save(&BackendSettings {
+            relay_profiles_enabled: true,
+            ..BackendSettings::default()
+        })
+        .unwrap();
+    let first = ctx.gateway.load().unwrap().providers[0].relay.id.clone();
+    let (_, second) = create_provider(
+        &ctx.gateway,
+        &ProviderInput {
+            name: "Mirror".into(),
+            model_list: "deepseek-v4-pro\nmirror-only".into(),
+            ..deepseek_input()
+        },
+        "",
+        None,
+    )
+    .unwrap();
+    enable_binding(
+        ctx,
+        &ToolId::Codex,
+        AgentBinding {
+            model: "deepseek-v4-flash".into(),
+            ..binding()
+        },
+    )
+    .unwrap();
+    let (_, group) = save_group(
+        &ctx.gateway,
+        &GroupInput {
+            name: "Shared".into(),
+            members: vec![GroupMember {
+                model: "deepseek-v4-pro".into(),
+                weight: 1,
+            }],
+            hide_members: true,
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let catalog = codex_catalog(ctx);
+    let entries = catalog["models"].as_array().unwrap();
+    for provider in [&first, &second] {
+        let slug = format!("{provider}/deepseek-v4-pro");
+        let entry = entries.iter().find(|entry| entry["slug"] == slug).unwrap();
+        assert_eq!(entry["codex_plus_group_id"], provider.as_str());
+    }
+    assert!(!entries.iter().any(|entry| entry["slug"] == "deepseek-v4-pro"));
+    assert!(entries.iter().any(|entry| entry["slug"] == format!("group/{group}")));
+
+    save_group(
+        &ctx.gateway,
+        &GroupInput {
+            id: group.clone(),
+            name: "Shared".into(),
+            members: vec![GroupMember {
+                model: "deepseek-v4-pro".into(),
+                weight: 1,
+            }],
+            hide_members: false,
+            ..GroupInput::default()
+        },
+    )
+    .unwrap();
+    refresh_enabled(ctx).unwrap();
+    let catalog = codex_catalog(ctx);
+    let entries = catalog["models"].as_array().unwrap();
+    assert!(entries.iter().any(|entry| entry["slug"] == "deepseek-v4-pro"));
+    for provider in [&first, &second] {
+        let slug = format!("{provider}/deepseek-v4-pro");
+        assert!(entries.iter().any(|entry| entry["slug"] == slug));
+    }
+}
+
+#[test]
 fn context_windows_follow_each_model_in_the_pool() {
     let fixture = fixture(57396);
     let ctx = &fixture.ctx;
@@ -2234,6 +4484,8 @@ fn codex_startup_upgrades_image_registration_without_a_port_change_or_resave() {
     seeded.relay_profiles_enabled = true;
     ctx.settings.save(&seeded).unwrap();
     enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+    let initial_generation =
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap();
     let original = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
     let (_, image_id) = create_provider(
         &ctx.gateway,
@@ -2260,6 +4512,10 @@ fn codex_startup_upgrades_image_registration_without_a_port_change_or_resave() {
     assert_eq!(reapply_if_port_changed(ctx).unwrap(), 0);
 
     assert!(codex_plus_core::gateway::apply::sync_codex_identity(ctx).unwrap());
+    assert_eq!(
+        codex_plus_core::gateway::connection_generation::read(&ctx.codex_home).unwrap(),
+        initial_generation
+    );
     assert!(codex_config(ctx).contains("codex-plus-gateway-image-generation"));
     assert!(codex_config(ctx).contains("http://127.0.0.1:57377/gw/codex/v1"));
     let refreshed = ctx.gateway.load().unwrap().binding(&ToolId::Codex).unwrap().clone();
@@ -2691,4 +4947,65 @@ fn codex_disconnect_to_a_fallback_provider_only_fills_missing_user_root_settings
         "新供应商缺的键照样补回：{config}"
     );
     assert_eq!(config.matches("model_instructions_file =").count(), 1);
+}
+
+/// #3115：网关模式（activeRelayId = codex-plus-gateway）重写 Codex 配置时，用户直接在
+/// live config.toml 里给 MCP 加的 `tool_timeout_sec`、`env` 不能被顶掉。网关重写走
+/// `relay_switch`，读「切换时保留」开关；托管供应商的模板里没有 MCP，开关关着时也保留。
+#[test]
+fn gateway_rewrite_keeps_live_mcp_edits_with_or_without_preserve_setting() {
+    for (preserve, port) in [(true, 57411), (false, 57412)] {
+        let fixture = fixture(port);
+        let ctx = &fixture.ctx;
+        std::fs::create_dir_all(&ctx.codex_home).unwrap();
+        let mut direct = codex_plus_core::provider_import::pool_relay_profile(
+            "直连",
+            "https://api.direct.test/v1",
+            "sk-direct",
+            RelayProtocol::Responses,
+            "gpt-direct",
+            "gpt-direct",
+            &[],
+        )
+        .unwrap();
+        direct.id = "direct".into();
+        direct.relay_mode = RelayMode::PureApi;
+        codex_plus_core::relay_config::normalize_relay_profile_for_storage(&mut direct).unwrap();
+        let mut seeded = BackendSettings::default();
+        seeded.relay_profiles_enabled = true;
+        seeded.relay_profiles = vec![direct];
+        seeded.active_relay_id = "direct".into();
+        seeded.relay_preserve_nonprovider_settings = preserve;
+        seeded.relay_context_config_contents = "[mcp_servers.my_tool]\ncommand = \"my-tool\"\n".into();
+        codex_plus_core::relay_switch::switch_relay_profile_in_home(
+            &ctx.settings,
+            &ctx.codex_home,
+            seeded,
+            "",
+        )
+        .unwrap();
+        enable_binding(ctx, &ToolId::Codex, binding()).unwrap();
+        assert_eq!(ctx.settings.load().unwrap().active_relay_id, "codex-plus-gateway");
+
+        // 用户在 live 里给这条 MCP 加超时和环境变量。
+        let config_path = ctx.codex_home.join("config.toml");
+        let mut doc = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        doc["mcp_servers"]["my_tool"]["tool_timeout_sec"] = toml_edit::value(120);
+        doc["mcp_servers"]["my_tool"]["env"] = toml_edit::table();
+        doc["mcp_servers"]["my_tool"]["env"]["MY_TOKEN"] = toml_edit::value("live-token");
+        std::fs::write(&config_path, doc.to_string()).unwrap();
+
+        // 网关重写 Codex 配置（池变化、身份同步、重启时都走这里）。
+        refresh_enabled(ctx).unwrap();
+        let config = std::fs::read_to_string(&config_path).unwrap();
+        assert!(config.contains("/gw/codex/v1"), "{config}");
+        assert!(
+            config.contains("tool_timeout_sec = 120") && config.contains("live-token"),
+            "preserve={preserve}：{config}"
+        );
+        assert!(config.contains("command = \"my-tool\""), "{config}");
+    }
 }

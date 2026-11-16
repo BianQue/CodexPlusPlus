@@ -43,6 +43,9 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
+/// Claude Desktop 完整功能模式的设置：类型定义在 claude-local（与 ClaudeMom 共用），这里只是重新导出。
+pub use claude_local::ClaudeLocalSettings;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RelayProfile {
@@ -1114,6 +1117,15 @@ pub struct BackendSettings {
     /// 默认关闭；用户手动改过模型的会话不受影响。
     #[serde(rename = "threadModelFollowSwitchEnabled", default)]
     pub thread_model_follow_switch_enabled: bool,
+    /// 非官方登录（API Key / 网关 / 聚合）时保留本地项目（#2947 / #3018）。
+    /// Codex 登录过 ChatGPT 后会建账号隔离容器，匿名身份的项目每次启动都被清空；
+    /// 打开后启动前把容器挪走、项目留在顶层，切回官方登录时再放回。默认关闭。
+    #[serde(rename = "keepProjectsWithoutAccount", default)]
+    pub keep_projects_without_account: bool,
+    /// 流式请求等上游响应头的上限（秒）。默认 120；首字时间经常超过 120s 的上游
+    /// （长推理模型、慢中转，#3130）可在 settings.json 调大，上限 3600，写小不生效。
+    #[serde(rename = "upstreamStreamHeaderTimeoutSecs", default)]
+    pub upstream_stream_header_timeout_secs: Option<u64>,
     /// 当前 Codex 原生 auth 的显式选择；None 表示旧版本未设置，Some(None) 表示明确不登录。
     #[serde(rename = "nativeAuthSelection", default)]
     pub native_auth_selection: Option<NativeAuthSelection>,
@@ -1169,6 +1181,9 @@ pub struct BackendSettings {
     // 默认开启：输入框上方的请求状态条（#2824），纯展示层；关掉后注入层停止轮询 /proxy-status。
     #[serde(rename = "codexAppProxyRequestStatus", default = "default_true")]
     pub codex_app_proxy_request_status: bool,
+    /// 原版 Claude 的本地兼容服务，与增强副本的开关独立，默认不接管启动。
+    #[serde(rename = "claudeDesktopLocal", default)]
+    pub claude_desktop_local: ClaudeLocalSettings,
     // 默认开启：只在受管副本的页面里加一个语音入口，识别走 Codex++ 自己的听写服务，
     // 不改官方应用、不动输入框已有内容；关掉只是没有入口，已运行的副本需重启才生效。
     #[serde(rename = "claudeAppVoiceInput", default = "default_true")]
@@ -1517,6 +1532,8 @@ impl Default for BackendSettings {
             provider_sync_enabled: false,
             session_index_repair_enabled: default_session_index_repair_enabled(),
             thread_model_follow_switch_enabled: false,
+            keep_projects_without_account: false,
+            upstream_stream_header_timeout_secs: None,
             native_auth_selection: None,
             provider_sync_saved_providers: Vec::new(),
             provider_sync_manual_providers: Vec::new(),
@@ -1539,6 +1556,7 @@ impl Default for BackendSettings {
             codex_app_usage_status_line: true,
             usage_history_enabled: false,
             codex_app_proxy_request_status: true,
+            claude_desktop_local: ClaudeLocalSettings::default(),
             claude_app_voice_input: true,
             claude_app_localization: true,
             claude_app_extensions: false,
@@ -1847,6 +1865,7 @@ impl BackendSettings {
             || self.active_relay_profile().rewrites_auto_review_model()
             || self.active_relay_profile().strips_image_generation_tool()
             || self.active_relay_profile().enables_pure_api_image_generation()
+            || self.active_relay_profile().strips_responses_image_detail()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -2895,6 +2914,12 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     {
         target.insert("threadModelFollowSwitchEnabled".to_string(), Value::Bool(value));
     }
+    if let Some(value) = source
+        .get("keepProjectsWithoutAccount")
+        .and_then(Value::as_bool)
+    {
+        target.insert("keepProjectsWithoutAccount".to_string(), Value::Bool(value));
+    }
     if let Some(value) = source.get("ccsDbPath").and_then(Value::as_str) {
         target.insert(
             "ccsDbPath".to_string(),
@@ -3534,7 +3559,11 @@ pub(crate) const RELAY_PROFILE_KNOWN_FIELDS: &[&str] = &[
     "trustUpstreamCatalogLite",
     "strictResponsesReasoning",
     "stripImageGenerationTool",
+    "stripResponsesImageDetail",
+    "disableToolSearch",
+    "pureApiImageGeneration",
     "autoReviewModel",
+    "multiAgent",
     "anthropicAuthHeader",
     "anthropicMaxTokens",
     "anthropicPromptCache",
@@ -6031,6 +6060,32 @@ experimental_bearer_token = "sk-existing""#
             };
             assert!(!profile.enables_pure_api_image_generation());
         }
+    }
+
+    /// 「移除 Responses 图片 detail 字段」只在代理里执行，打开后必须改走本地代理，
+    /// 否则直连 Responses 上游时开关形同虚设（界面文案也写明会改走代理）。
+    #[test]
+    fn strip_responses_image_detail_routes_through_protocol_proxy() {
+        let enabled = RelayProfile {
+            id: "on".to_string(),
+            relay_mode: RelayMode::PureApi,
+            protocol: RelayProtocol::Responses,
+            base_url: "https://responses.example.test/v1".to_string(),
+            strip_responses_image_detail: true,
+            ..RelayProfile::default()
+        };
+        let settings = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![enabled.clone()],
+            ..BackendSettings::default()
+        };
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
+        let off = BackendSettings {
+            active_relay_id: "on".to_string(),
+            relay_profiles: vec![RelayProfile { strip_responses_image_detail: false, ..enabled }],
+            ..BackendSettings::default()
+        };
+        assert!(!off.active_relay_transport_uses_protocol_proxy());
     }
 
     #[test]

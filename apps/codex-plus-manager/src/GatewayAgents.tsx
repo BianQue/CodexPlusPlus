@@ -2,8 +2,10 @@
 import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, Check, ChevronDown, ChevronRight, Copy, FolderOpen, List, Search, Shuffle, Star, Waypoints, X } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, ChevronRight, Copy, FolderOpen, List, Loader2, Play, RotateCcw, Search, Shuffle, Square, Star, Waypoints, X } from "lucide-react";
 import { t, tf } from "./i18n";
+import { appConfirm } from "./app-dialog";
+import { modelSlugFromRowName } from "./model-metadata";
 import { AgentDisconnectDialog } from "./AgentDisconnectDialog";
 import { agentDiagnosticPresentation, agentPresentation, canReconnectAgent, diagnosticErrorLabel, diagnosticEvidenceLabel } from "./gateway-agent-safety";
 import { ManualGuideDialog } from "./GatewayManualGuide";
@@ -20,8 +22,11 @@ import {
   visibleOwnModels,
   pickerSections,
   providerEnabled,
+  qualifiedProvider,
+  servingProviders,
   validateDraft,
   type BindingDraft,
+  type DefaultModelSelection,
   type GatewayAgentId,
   type GatewayAgentView,
   type GatewayPayload,
@@ -30,6 +35,7 @@ import {
   maskAccountName,
   relativeTime,
   type ImageOption,
+  imageModelLabel,
   isFavoriteModel,
   toggleFavoriteModel,
   type GatewayResult,
@@ -44,6 +50,30 @@ import { useAgentFocus } from "./agent-focus-store";
 import { CxBadge, CxCard, CxEmpty, CxSection, CxStatusIcon } from "./cx-layout";
 import { AGENT_ICONS, AutoTag, Avatar, ModelViewGlyph, Switch, avatarOf, loadFavorites, saveFavorites, type Notify, type Run, AgentIcon } from "./gateway-ui";
 
+/** Codex 行的启动 / 停止：和侧栏 `cx-side-run` 用的同一份 App 状态（`App` 里只建一份，两处共用）。 */
+export type CodexRunControls = {
+  running: boolean;
+  busy: boolean;
+  unavailableReason: string | null;
+  onStart: () => void;
+  onStop: () => void;
+};
+
+/**
+ * `claude_local_status` / `claude_local_action` 的返回：`CommandResult` 把状态字段 flatten 到顶层，
+ * 失败时只有 `{ status, message }`，所以每个字段都可能缺。
+ */
+type ClaudeLocalRunStatus = {
+  status: string;
+  message?: string;
+  running?: boolean;
+  localProcess?: boolean;
+  supported?: boolean;
+  claudeRunning?: boolean;
+  nodeAvailable?: boolean;
+  config?: { enabled?: boolean };
+};
+
 export function AgentsView({
   payload,
   busy,
@@ -51,6 +81,7 @@ export function AgentsView({
   notify,
   onManage,
   onOpenCodexProviderSettings,
+  codexRun,
 }: {
   payload: GatewayPayload | null;
   busy: string | null;
@@ -58,6 +89,8 @@ export function AgentsView({
   notify: Notify;
   onManage: () => void;
   onOpenCodexProviderSettings?: () => void;
+  /** Codex 行的启动 / 停止：不传（比如总览里的接入弹窗）就不显示那个键。 */
+  codexRun?: CodexRunControls;
 }) {
   // 没勾选的 Agent 不列；它们已经接入的话照常工作，到设置里「我用的 Agent」重新勾选就能再管理。
   const focus = useAgentFocus();
@@ -72,6 +105,7 @@ export function AgentsView({
     <AgentRow
       agent={agent}
       busy={busy}
+      codexRun={codexRun}
       expanded={expanded === agent.agent}
       key={agent.agent}
       notify={notify}
@@ -155,10 +189,12 @@ function AgentRow({
   onOpenCodexProviderSettings,
   run,
   notify,
+  codexRun,
 }: {
   agent: GatewayAgentView;
   payload: GatewayPayload | null;
   busy: string | null;
+  codexRun?: CodexRunControls;
   expanded: boolean;
   onToggleExpand: () => void;
   onManage: () => void;
@@ -177,15 +213,67 @@ function AgentRow({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bindingKey]);
 
-  const isClaude = agent.agent === "claude";
+  // 「Agent 接入」页里 Claude Desktop 的绑定 id 是 `claude-desktop`；`claude` 是 Claude Code（命令行），
+  // 两行都要能展开档位，但只有前者有本地启动器。
+  const isClaude = agent.agent === "claude" || agent.agent === "claude-desktop";
+  /** 只有「Claude Desktop」这一行有本地启动器；`claude` 是 Claude Code（命令行），不在这里启动。 */
+  const canLaunchClaudeDesktop = agent.agent === "claude-desktop";
+  const isCodex = agent.agent === "codex";
   const connected = agent.enabled;
-  const save = async (next: BindingDraft) => {
-    const error = validateDraft(next, payload, connected ? binding?.model : undefined);
+  /**
+   * Claude Desktop 有本地启动器：行上给一个启动 / 停止键（Codex 的启动入口在侧栏和总览，这里不重复）。
+   * 状态读一次 `claude_local_status`（要查进程和钥匙串，不轮询），动作完成后再读一次。
+   */
+  const [claudeRun, setClaudeRun] = useState<{ running: boolean; unavailableReason: string | null } | null>(null);
+  const [claudeBusy, setClaudeBusy] = useState(false);
+  const refreshClaudeRun = async () => {
+    try {
+      const result = await invoke<ClaudeLocalRunStatus>("claude_local_status");
+      if (result.status !== "ok") return;
+      // 代理活着、或 Claude 还挂在我们的代理端口上，都算「在跑」：按钮该给停止，点了就能收尾。
+      const attached = Boolean(result.running || result.localProcess);
+      setClaudeRun({
+        running: attached,
+        unavailableReason: !result.supported
+          ? t("未检测到支持的 Claude Desktop")
+          : result.claudeRunning && !attached
+            ? t("Claude 正在运行，请先完全退出，再从 Codex++ 启动")
+            : result.config?.enabled && !result.nodeAvailable
+              ? t("缺少 Node.js，无法启动本地服务")
+              : null,
+      });
+    } catch {
+      // 读不到状态（比如非 macOS）：不显示启动键，比显示一个点了必失败的键好。
+    }
+  };
+  useEffect(() => {
+    if (canLaunchClaudeDesktop) void refreshClaudeRun();
+    // 只在 Claude 那一行探测一次；动作后自己会刷新。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isClaude]);
+  const claudeAction = async (action: "launch" | "stop") => {
+    if (claudeBusy) return;
+    setClaudeBusy(true);
+    try {
+      const result = await invoke<ClaudeLocalRunStatus>("claude_local_action", { action });
+      if (result.status !== "ok") await notify(t("Claude 本地模式"), result.message ?? t("操作失败"), "failed");
+    } catch (error) {
+      await notify(t("Claude 本地模式"), String(error), "failed");
+    } finally {
+      setClaudeBusy(false);
+      await refreshClaudeRun();
+    }
+  };
+  const save = async (next: BindingDraft, updateDraft = true, item?: PickerItem) => {
+    const error = validateDraft(next, payload, connected ? binding?.model : undefined, connected && !item ? binding?.defaultModelSelection : null);
     if (error) {
       void notify(t("还不能接入"), t(error), "warning");
       return false;
     }
-    return run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(next, binding) }, t("保存网关绑定"), connected);
+    if (updateDraft) setDraft(next);
+    const saved = await run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(next, binding, item) }, t("保存网关绑定"), connected);
+    if (!saved && updateDraft) setDraft(draft);
+    return saved;
   };
   const disconnect = () => setDisconnectTarget("disconnect");
   // 手动接入（Trae CN 等）：没有模型下拉和断开预览，行里是「接入指引」。
@@ -194,7 +282,7 @@ function AgentRow({
   // 在选择器里选模型：已接入时直接改默认模型，未接入时选完即接入。
   const pick = (item: PickerItem) => {
     setPickerOpen(false);
-    void save({ ...draft, model: item.model });
+    void save({ ...draft, model: item.providerModel ?? item.model }, false, item);
   };
   // 已接入时先预览还原差异，确认后才断开并选择直连模型。
   const pickOwn = async (item: PickerItem) => {
@@ -235,7 +323,7 @@ function AgentRow({
   const modelCount = agentModels(payload, draft.poolExclude).length;
   const reconnectAllowed = canReconnectAgent(agent, payload?.relayProfilesEnabled);
   const reconnect = () =>
-    run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(draft, binding) }, t("重新接入"));
+    run(`save:${agent.agent}`, "save_gateway_binding", { agent: agent.agent, binding: bindingFromDraft(draft, binding), reconnect: true }, t("重新接入"));
   const note = diagnostic.reconnect
     ? drift?.by ? tf("配置被 {0} 改了", [drift.by]) : t("当前文件与接入配置不一致")
     : connected && isClaude
@@ -310,7 +398,49 @@ function AgentRow({
             payload={payload}
           />
           )}
-          <Switch disabled={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
+          {isCodex && codexRun ? (
+            <button
+              aria-label={codexRun.running ? t("停止 Codex") : t("启动 Codex")}
+              className="gw-icon-button gw-agent-run"
+              data-running={codexRun.running}
+              data-unavailable={!codexRun.running && Boolean(codexRun.unavailableReason)}
+              disabled={codexRun.busy || (!codexRun.running && Boolean(codexRun.unavailableReason))}
+              onClick={(event) => {
+                event.stopPropagation();
+                (codexRun.running ? codexRun.onStop : codexRun.onStart)();
+              }}
+              title={codexRun.busy ? t("处理中…") : codexRun.running ? t("停止 Codex") : codexRun.unavailableReason ?? t("启动 Codex")}
+              type="button"
+            >
+              {codexRun.busy
+                ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+                : codexRun.running
+                  ? <Square aria-hidden="true" className="h-4 w-4" />
+                  : <Play aria-hidden="true" className="h-4 w-4" />}
+            </button>
+          ) : null}
+          {canLaunchClaudeDesktop && claudeRun ? (
+            <button
+              aria-label={claudeRun.running ? t("停止本地服务") : t("启动 Claude")}
+              className="gw-icon-button gw-agent-run"
+              data-running={claudeRun.running}
+              disabled={claudeBusy || (!claudeRun.running && Boolean(claudeRun.unavailableReason))}
+              onClick={(event) => {
+                event.stopPropagation();
+                void claudeAction(claudeRun.running ? "stop" : "launch");
+              }}
+              title={claudeBusy ? t("处理中…") : claudeRun.running ? t("停止本地服务") : claudeRun.unavailableReason ?? t("启动 Claude")}
+              type="button"
+            >
+              {claudeBusy
+                ? <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+                : claudeRun.running
+                  ? <Square aria-hidden="true" className="h-4 w-4" />
+                  : <Play aria-hidden="true" className="h-4 w-4" />}
+            </button>
+          ) : null}
+          {binding && !manual ? <ResetModelSelections agent={agent} busy={busy !== null} run={run} /> : null}
+          <Switch pending={busy !== null} label={tf("{0} 接入 Codex++", [agent.name])} on={connected} onToggle={toggle} />
           <button
             aria-expanded={expanded}
             aria-label={isClaude ? t("档位") : t("详情")}
@@ -346,6 +476,22 @@ function AgentRow({
   );
 }
 
+function ResetModelSelections({ agent, busy, run }: { agent: GatewayAgentView; busy: boolean; run: Run }) {
+  const reset = async () => {
+    const accepted = await appConfirm(
+      t("重置后，历史会话可能按当前路由规则选择供应商。有效的当前默认模型供应商身份会保留；失效的当前默认选择会清除。是否继续？"),
+      { title: tf("重置 {0} 的历史模型选择", [agent.name]), confirmText: t("重置"), danger: true },
+    );
+    if (!accepted) return;
+    await run(`reset-model-selections:${agent.agent}`, "reset_gateway_model_selections", { agent: agent.agent }, t("重置历史模型选择"));
+  };
+  return (
+    <button aria-label={t("重置历史模型选择")} className="gw-icon-button" disabled={busy} onClick={() => void reset()} title={t("重置历史模型选择")} type="button">
+      <RotateCcw aria-hidden="true" className="h-4 w-4" />
+    </button>
+  );
+}
+
 /**
  * 展开的详情（行下展开，不跳页）：接入状态、用哪些供应商、Claude 档位，常用的就这几行；
  * 起名 / 审批 / 生图模型、未知模型名、默认窗口这些默认值大多数人不用改，收进「高级」。底部是改动的文件、查看差异、断开并还原。
@@ -370,7 +516,9 @@ function AgentDetail({
   /** 去供应商池（弹窗里是关掉弹窗再去）。 */
   onManage: () => void;
 }) {
-  const isClaude = agent.agent === "claude";
+  // 「Agent 接入」页里 Claude Desktop 的绑定 id 是 `claude-desktop`；`claude` 是 Claude Code（命令行），
+  // 两行都要能展开档位，但只有前者有本地启动器。
+  const isClaude = agent.agent === "claude" || agent.agent === "claude-desktop";
   const [selecting, setSelecting] = useState(false);
   const [windowText, setWindowText] = useState(draft.contextWindow);
   // 通用 Agent 有的只能在自己界面里填 Key（如 Zed 存在钥匙串里）：给出地址和本 Agent 的网关 token 一键复制。
@@ -554,11 +702,11 @@ function AgentDetail({
         )}
         {isClaude ? (
           <SetLine hint={t("非 claude-* 模型名时也照常发送 effort")} title={t("强制启用推理强度")} tooltip={t("非 claude-* 模型名时 Claude Code 默认不发 effort，打开后照常发送。")}>
-            <Switch disabled={busy !== null} label={t("强制启用推理强度")} on={draft.claudeEnableEffort} onToggle={() => onSave({ ...draft, claudeEnableEffort: !draft.claudeEnableEffort })} />
+            <Switch pending={busy !== null} label={t("强制启用推理强度")} on={draft.claudeEnableEffort} onToggle={() => onSave({ ...draft, claudeEnableEffort: !draft.claudeEnableEffort })} />
           </SetLine>
         ) : null}
         <SetLine hint={t("新加的供应商默认给这个 Agent 用")} title={t("添加供应商时自动加入")} tooltip={t("关掉后，新添加的供应商默认不给这个 Agent 用；添加时仍可手动勾选。")}>
-          <Switch disabled={busy !== null} label={t("添加供应商时自动加入")} on={draft.autoJoinProviders} onToggle={() => onSave({ ...draft, autoJoinProviders: !draft.autoJoinProviders })} />
+          <Switch pending={busy !== null} label={t("添加供应商时自动加入")} on={draft.autoJoinProviders} onToggle={() => onSave({ ...draft, autoJoinProviders: !draft.autoJoinProviders })} />
         </SetLine>
       </details>
       {/* 手动接入没有改动的配置文件，断开就是行里的开关。 */}
@@ -737,16 +885,19 @@ export function ModelList({
   payload,
   exclude,
   selectedModel,
+  selectedModelSelection,
   head,
   skipGroup,
   onPick,
   own,
   ownAgent,
   onPickOwn,
+  pinProvider = false,
 }: {
   payload: GatewayPayload | null;
   exclude: string[];
   selectedModel: string;
+  selectedModelSelection?: DefaultModelSelection | null;
   head?: ReactNode;
   skipGroup?: string;
   onPick: (item: PickerItem) => void;
@@ -754,6 +905,7 @@ export function ModelList({
   /** Agent 的显示名，自带模型的说明里用。 */
   ownAgent?: string;
   onPickOwn?: (item: PickerItem) => void;
+  pinProvider?: boolean;
 }) {
   const nav = useContext(GatewayNavContext);
   const [query, updateQuery] = useState("");
@@ -799,6 +951,19 @@ export function ModelList({
       .map((section) => ({ ...section, items: section.items.filter((item) => isFavoriteModel(favorites, item.model, payload)) }))
       .filter((section) => section.items.length);
   }, [payload, query, exclude, favoritesOnly, sectionOnly, favorites, skipGroup, ownList]);
+  const displaySections = useMemo<PickerSection[]>(() => {
+    const current = selectedModel.trim();
+    if (pinProvider && !favoritesOnly && !sectionOnly && !query.trim() && current && modelDisplay(payload, current, exclude).auto &&
+        !sections.some((section) => section.items.some((item) => !item.direct && item.model.toLowerCase() === current.toLowerCase()))) {
+      return [{
+        key: "current",
+        title: "当前选择",
+        avatar: "",
+        items: [{ model: current, label: modelDisplay(payload, current, exclude).title, sub: "按供应商池顺序尝试", avatar: "" }],
+      }, ...sections];
+    }
+    return sections;
+  }, [sections, selectedModel, pinProvider, favoritesOnly, sectionOnly, query, payload, exclude]);
   const toggleFavorite = (model: string) => {
     const next = toggleFavoriteModel(favorites, model, payload);
     setFavorites(next);
@@ -814,8 +979,18 @@ export function ModelList({
     if (listRef.current) listRef.current.scrollTop = 0;
   };
   const isSelected = (item: PickerItem) => {
-    const current = item.direct ? ownList?.current ?? "" : selectedModel;
-    return Boolean(current) && item.model.toLowerCase() === current.toLowerCase();
+    const current = item.direct ? ownList?.current ?? "" : modelSlugFromRowName(selectedModel);
+    if (!item.direct && selectedModelSelection && current.toLowerCase() ===
+        `${selectedModelSelection.providerId}/${modelSlugFromRowName(selectedModelSelection.upstreamModel)}`.toLowerCase()) {
+      return !selectedModelSelection.providerRemoved
+        && item.defaultModelSelection?.providerId === selectedModelSelection.providerId
+        && modelSlugFromRowName(item.defaultModelSelection.upstreamModel).toLowerCase() === modelSlugFromRowName(selectedModelSelection.upstreamModel).toLowerCase()
+        && item.defaultModelSelection.providerSource === selectedModelSelection.providerSource;
+    }
+    const model = item.direct ? item.model : modelSlugFromRowName(item.model);
+    const providerModel = item.direct ? item.providerModel : item.providerModel && modelSlugFromRowName(item.providerModel);
+    return Boolean(current) && (model.toLowerCase() === current.toLowerCase() ||
+      Boolean(providerModel && qualifiedProvider(payload, current, exclude) && providerModel.toLowerCase() === current.toLowerCase()));
   };
   const choose = (item: PickerItem) => (item.direct && onPickOwn ? onPickOwn(item) : onPick(item));
 
@@ -823,8 +998,8 @@ export function ModelList({
     () => withOwnSection(pickerSections(payload, "", avatarOf, exclude, skipGroup), ownPickerSection(ownList, "", avatarOf)).filter((section) => section.key !== "custom"),
     [payload, exclude, skipGroup, ownList],
   );
-  const total = sections.reduce((sum, section) => sum + section.items.length, 0);
-  const customCount = sections.find((section) => section.key === "custom")?.items.length ?? 0;
+  const total = displaySections.reduce((sum, section) => sum + section.items.length, 0);
+  const customCount = displaySections.find((section) => section.key === "custom")?.items.length ?? 0;
 
   // 排版：搜索 + 一排横向筛选在上；列表每个模型两行（模型名 / 供应商）；「默认」「断开」这类操作在底部。
   return (
@@ -847,12 +1022,12 @@ export function ModelList({
         </div>
       </div>
       <div className="gw-mp-list" ref={listRef}>
-        {sections.length === 0 ? (
+        {displaySections.length === 0 ? (
           <div className="gw-empty">
             {favoritesOnly ? t("还没有收藏的模型，点模型右侧的星标收藏。") : payload?.pool.length ? t("没有匹配的模型") : t("供应商池是空的，先到「供应商」里添加。")}
           </div>
         ) : null}
-        {sections.map((section) => {
+        {displaySections.map((section) => {
           const provider = providersBySection.get(section.key);
           const expanded = searching ? !closedSearchSections.includes(section.key) : openSections[section.key] ?? !section.key.startsWith("provider:");
           return (
@@ -871,8 +1046,8 @@ export function ModelList({
                 type="button"
               >
                 <ChevronRight aria-hidden="true" className="gw-mp-heading-arrow h-3.5 w-3.5" data-open={expanded} />
-                {section.key === "group" ? <Waypoints className="h-3.5 w-3.5" /> : section.key === "auto" ? <Shuffle className="h-3.5 w-3.5" /> : section.key === "custom" ? null : <Avatar baseUrl={provider?.baseUrl} name={provider?.name ?? section.title} size="sm" />}
-                <span className="gw-mp-heading-name">{section.key === "group" || section.key === "custom" || section.key === "auto" ? t(section.title) : section.title}</span>
+                {section.key === "group" ? <Waypoints className="h-3.5 w-3.5" /> : section.key === "auto" || section.key === "current" ? <Shuffle className="h-3.5 w-3.5" /> : section.key === "custom" ? null : <Avatar baseUrl={provider?.baseUrl} name={provider?.name ?? section.title} size="sm" />}
+                <span className="gw-mp-heading-name">{section.key === "group" || section.key === "custom" || section.key === "auto" || section.key === "current" ? t(section.title) : section.title}</span>
                 <em>{section.items.length}</em>
               </button>
               {section.key === "group" && nav.openModelGroups ? (
@@ -882,21 +1057,28 @@ export function ModelList({
             {expanded ? section.items.map((item) => {
               const selected = isSelected(item);
               const favorite = isFavoriteModel(favorites, item.model, payload);
+              const candidate = item.providerModel ?? (item.custom ? item.model : "");
+              const ambiguous = Boolean(pinProvider && candidate && (
+                candidate.toLowerCase().startsWith(GROUP_MODEL_PREFIX) ||
+                candidate.includes("*") ||
+                servingProviders(payload, candidate, exclude).length
+              ));
               return (
                 <div
                   aria-selected={selected}
+                  aria-disabled={ambiguous || undefined}
                   className="gw-mp-item"
                   data-direct={item.direct ? true : undefined}
                   data-selected={selected}
                   key={item.model}
-                  onClick={() => choose(item)}
-                  onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) choose(item); }}
+                  onClick={() => { if (!ambiguous) choose(item); }}
+                  onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget && !ambiguous) choose(item); }}
                   role="option"
                   tabIndex={0}
                 >
                   <span className="gw-mp-text">
                     <strong title={item.model.startsWith(GROUP_MODEL_PREFIX) ? item.sub : item.model}>{item.label}</strong>
-                    {item.custom ? <small>{item.sub} · {t("自定义模型 ID")}</small> : item.sub && item.sub !== section.title ? <small>{item.sub}</small> : null}
+                    {ambiguous ? <small>{t("模型 ID 与已有模型名冲突，无法固定到此供应商")}</small> : item.custom ? <small>{item.sub} · {t("自定义模型 ID")}</small> : item.sub && item.sub !== section.title ? <small>{section.key === "current" ? t(item.sub) : item.sub}</small> : null}
                   </span>
                   {item.direct ? (
                     <em className="gw-mp-direct" title={tf("{0} 用自己的登录或 Key 直接向 {1} 要这个模型，不经 Codex++。选它会断开 Codex++ 并还原接入前的设置。", [ownAgent ?? "Agent", item.direct])}>
@@ -932,9 +1114,9 @@ function withOwnSection(sections: PickerSection[], own: PickerSection | null): P
   return custom < 0 ? [...sections, own] : [...sections.slice(0, custom), own, ...sections.slice(custom)];
 }
 
-/** 一项生图选项的显示名：「ChatGPT Pro · gpt-image」。 */
+/** 一项生图选项的显示名：「ChatGPT Pro · GPT Image」。 */
 function imageOptionLabel(option: ImageOption): string {
-  return `${maskAccountName(shortProviderName(option.providerName))} · ${option.model}`;
+  return `${maskAccountName(shortProviderName(option.providerName))} · ${imageModelLabel(option.model, option.vendorPicks)}`;
 }
 
 /** Agent 详情里的「生图模型」：这个 Agent 的生图请求经网关发给谁。 */
@@ -977,7 +1159,7 @@ function ImageModelRow({ agent, payload, busy, run }: { agent: string; payload: 
           tooltip={t("上游只返回图片链接时，网关把图下载下来转成图片数据再交给 Agent（Codex 只认图片数据）。关掉后原样转发链接。")}
         >
           <Switch
-            disabled={busy !== null}
+            pending={busy !== null}
             label={t("图片链接转成图片数据")}
             on={inlineUrls}
             onToggle={() => void run(`image-inline:${agent}`, "save_gateway_image_inline", { agent, enabled: !inlineUrls }, t("保存生图选项"), true)}
@@ -1000,7 +1182,7 @@ function OwnModelsRow({ agent, payload, busy, run }: { agent: GatewayAgentView; 
       tooltip={tf("{0} 用自己的登录或 Key 直接向 {1} 要的模型，不经 Codex++。关掉后模型下拉只列网关的模型；{0} 现在用着的那个照样显示。", [agent.name, own.vendor])}
     >
       <Switch
-        disabled={busy !== null}
+        pending={busy !== null}
         label={tf("在模型下拉里显示 {0} 自带的模型", [agent.name])}
         on={shown}
         onToggle={() => void run(`own-shown:${agent.agent}`, "save_gateway_own_models_shown", { agent: agent.agent, shown: !shown }, t("保存自带模型的显示设置"), true)}
@@ -1042,18 +1224,37 @@ function ModelPicker({
   onDisconnect: () => void;
 }) {
   const buttonRef = useRef<HTMLButtonElement>(null);
-  const inactive = disabledGroup(payload, draft.model);
-  const effectiveModel = connected && inactive ? agent.defaultModel : draft.model;
-  const display = inactive && connected && !effectiveModel
+  const selection = payload?.gateway.bindings[agent.agent as GatewayAgentId]?.defaultModelSelection;
+  const inactive = disabledGroup(payload, draft.model, selection);
+  const original = modelDisplay(payload, draft.model, draft.poolExclude, selection);
+  const selectionProvider = selection && payload?.pool.find((entry) => entry.id === selection.providerId);
+  const unavailable = agent.defaultSelectionStatus
+    ? agent.defaultSelectionStatus === "fallback"
+    : original.issue === "unavailable"
+      && (!selectionProvider || !providerEnabled(selectionProvider) || draft.poolExclude.includes(selectionProvider.id) || selection?.providerRemoved);
+  const effectiveModel = connected ? agent.defaultModel : draft.model;
+  const effectiveSelection = unavailable ? null : selection;
+  const baseDisplay = connected && !effectiveModel
     ? { title: "", sub: "", group: false }
-    : modelDisplay(payload, effectiveModel, draft.poolExclude);
+    : connected && agent.defaultModelDiffers && agent.defaultSelectionStatus !== "invalid" && !effectiveModel.startsWith("group/")
+      ? { title: effectiveModel, sub: "", group: false }
+    : modelDisplay(payload, effectiveModel, draft.poolExclude, effectiveSelection);
+  const display = connected && agent.defaultSelectionStatus === "invalid"
+    ? { ...baseDisplay, issue: "invalid" as const }
+    : connected && agent.defaultSelectionStatus === "available"
+      ? { ...baseDisplay, issue: undefined }
+      : baseDisplay;
   const inactiveHint = inactive && connected
-    ? tf("原模型组「{0}」已停用，当前使用 {1}", [inactive.name, display.title || t("未设置")])
+    ? tf("原模型组「{0}」已停用，网关默认回退为 {1}", [inactive.name, display.title || t("未设置")])
+    : unavailable && connected
+      ? tf("原默认模型「{0}」不可用，网关默认回退为 {1}", [original.title, display.title || t("未设置")])
     : undefined;
   // 没接入、Agent 用着自带的某个模型：按钮上显示它（直连）。
   const own = connected ? null : ownCurrent(agent);
   const showDefault = !connected && !draft.model && !own;
-  const selectedModel = connected || draft.model ? effectiveModel.trim() || agentModels(payload, draft.poolExclude)[0] || "" : "";
+  const selectedModel = connected && agent.defaultModelDiffers && !effectiveModel.startsWith("group/")
+    ? ""
+    : connected || draft.model ? effectiveModel.trim() || (connected ? "" : agentModels(payload, draft.poolExclude)[0] || "") : "";
   const head = (
     <>
       {/* 用默认 = 断开网关并还原接入前的配置，只放这一个入口。 */}
@@ -1091,7 +1292,9 @@ function ModelPicker({
           own={visibleOwnModels(agent, payload)}
           ownAgent={agent.name}
           payload={payload}
+          pinProvider
           selectedModel={selectedModel}
+          selectedModelSelection={effectiveSelection}
         />
       </Floating>
     </div>

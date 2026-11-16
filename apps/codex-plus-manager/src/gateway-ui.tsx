@@ -1,5 +1,5 @@
 /** 本地网关页各标签共用的小组件与类型。 */
-import type { CSSProperties, ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { KeyRound, Shuffle, Waypoints } from "lucide-react";
 import { t, tf } from "./i18n";
@@ -152,9 +152,33 @@ export function Avatar({ name, baseUrl = "", size = "md", plain = false }: { nam
   );
 }
 
-export function Switch({ on, disabled, label, onToggle }: { on: boolean; disabled?: boolean; label: string; onToggle: () => void }) {
+/**
+ * `disabled`：长期不可用（灰色）。
+ * `pending`：页面上有保存在进行（#2973）。此时只拦点击、不变灰，避免整页开关一起闪；
+ * 被点的那个先乐观显示新状态，保存结束后以最新数据为准（失败即回滚）。
+ */
+export function Switch({ on, disabled, pending, label, onToggle }: { on: boolean; disabled?: boolean; pending?: boolean; label: string; onToggle: () => void }) {
+  const [optimistic, setOptimistic] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!pending) setOptimistic(null);
+  }, [pending, on]);
+  const shown = optimistic ?? on;
   return (
-    <button aria-checked={on} aria-label={label} className={`gw-switch ${on ? "is-on" : ""}`} disabled={disabled} onClick={onToggle} role="switch" type="button">
+    <button
+      aria-checked={shown}
+      aria-disabled={pending || undefined}
+      aria-label={label}
+      className={`gw-switch ${shown ? "is-on" : ""}`}
+      data-pending={pending ? "true" : undefined}
+      disabled={disabled}
+      onClick={() => {
+        if (pending) return;
+        setOptimistic(!on);
+        onToggle();
+      }}
+      role="switch"
+      type="button"
+    >
       <span />
     </button>
   );
@@ -263,5 +287,9 @@ export function ModelViewGlyph({ view }: { view: ModelView }) {
 
 /** 模型名后的「自动」小标签：多家自动切换时显示，悬停列出按顺序尝试的几家。 */
 export function AutoTag({ view }: { view: ModelView }) {
+  if (view.issue) {
+    const label = view.issue === "invalid" ? "模型身份不可用" : view.issue === "conflict" ? "模型名冲突" : "供应商不可用";
+    return <em className="gw-auto-tag" title={t("请重新选择默认模型")}>{t(label)}</em>;
+  }
   return view.auto ? <em className="gw-auto-tag" title={view.sub}>{t("自动")}</em> : null;
 }

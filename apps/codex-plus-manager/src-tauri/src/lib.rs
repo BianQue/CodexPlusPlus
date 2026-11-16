@@ -17,6 +17,7 @@ pub mod install;
 mod lightweight;
 mod provider_lookup_commands;
 mod runtime_health;
+mod skill_backup_usage;
 mod tray_panel;
 mod shutdown_watchdog;
 
@@ -241,6 +242,44 @@ pub fn run() {
     // 失败只记诊断日志，不影响启动。
     #[cfg(target_os = "macos")]
     std::thread::spawn(codex_plus_core::update::macos::cleanup_stale_update_transactions);
+    // 已经装上的版本不再需要安装包：删掉 updates/ 里不高于当前版本的安装包（#3094）。
+    std::thread::spawn(|| {
+        let removed = codex_plus_core::update::prune_installed_installers(
+            &codex_plus_core::paths::default_app_state_dir().join("updates"),
+            codex_plus_core::version::VERSION,
+        );
+        if !removed.is_empty() {
+            let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                "update.installers_pruned",
+                serde_json::json!({
+                    "count": removed.len(),
+                    "files": removed
+                        .iter()
+                        .filter_map(|path| path.file_name())
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+    });
+    // Codex++ 重启后在原端口恢复 Claude 仍挂接着的本地代理（后台做，不阻塞启动）。
+    std::thread::spawn(|| {
+        match codex_plus_core::claude_local_backend::resume_attached_proxy() {
+            Ok(Some(port)) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "claude_local.resumed",
+                    serde_json::json!({"port": port}),
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = codex_plus_core::diagnostic_log::append_diagnostic_log(
+                    "claude_local.resume_failed",
+                    serde_json::json!({"message": format!("{error:#}")}),
+                );
+            }
+        }
+    });
     if let Ok(settings) = codex_plus_core::settings::SettingsStore::default().load() {
         // 请求体上限是运行期策略：管理器启动即按设置应用，之后启动的 helper 直接继承，
         // 不必等完整启动流程。环境变量仍由 launcher 侧统一优先。
@@ -346,6 +385,9 @@ pub fn run() {
             commands::download_dictation_local_model,
             commands::load_global_dictation_hotkey,
             commands::set_global_dictation_hotkey,
+            commands::claude_local_status,
+            commands::claude_local_configure,
+            commands::claude_local_action,
             commands::claude_localization_status,
             commands::claude_localization_bash_timeout_status,
             commands::claude_localization_action,
@@ -395,6 +437,7 @@ pub fn run() {
             gateway_commands::use_gateway_own_model,
             gateway_commands::save_gateway_own_models_shown,
             gateway_commands::rotate_gateway_token,
+            gateway_commands::reset_gateway_model_selections,
             gateway_commands::save_gateway_model_suffix,
             gateway_commands::save_gateway_local_login_discovery,
             gateway_commands::scan_gateway_local_logins,
@@ -536,6 +579,15 @@ pub fn run() {
             commands::delete_user_script,
             commands::refresh_skill_catalog,
             commands::list_installed_skills,
+            commands::list_skill_file_times,
+            commands::find_skill_repository_matches,
+            commands::apply_skill_repository_matches,
+            commands::discover_skill_source_evidence,
+            commands::preview_skill_duplicates,
+            commands::archive_skill_duplicate,
+            commands::preview_skill_in_place_update,
+            commands::discard_skill_in_place_update_preview,
+            commands::execute_skill_in_place_update,
             commands::import_ccs_skills,
             commands::import_local_skills,
             commands::install_skill,
@@ -545,6 +597,7 @@ pub fn run() {
             commands::uninstall_skill,
             commands::restore_skill_backup,
             commands::delete_skill_backup,
+            skill_backup_usage::skill_backup_usage,
             commands::upsert_skill_repo,
             commands::inspect_skill_repo,
             commands::delete_skill_repo,
@@ -661,6 +714,7 @@ pub fn run() {
                         // 常驻本地代理只在 Codex++ 退出时停止；Codex 会话结束
                         // 不会关它（见 core::resident_helper）。
                         gateway_commands::restore_for_exit();
+                        codex_plus_core::claude_local_backend::stop_backend();
                         codex_plus_core::resident_helper::stop_resident_helper();
                         SHUTDOWN_COMPLETE.store(true, Ordering::SeqCst);
                         app.exit(0);
