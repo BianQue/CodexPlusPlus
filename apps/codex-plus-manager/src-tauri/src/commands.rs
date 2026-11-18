@@ -8931,7 +8931,7 @@ pub fn load_request_logs(
     let filter = codex_plus_core::request_log::RequestLogFilter {
         since_ms,
         agent: present(agent),
-        relay_id: present(relay_id),
+        relay_id,
         model: present(model),
     };
     match codex_plus_core::request_log::read_request_log_page(limit, &filter) {

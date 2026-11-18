@@ -7226,7 +7226,7 @@ function RequestLogScreen({ initialAgent = "all", initialFocus = {}, onConsumeIn
   // 时间段、供应商、模型在后端筛：日志只读最近 REQUEST_LOG_LIMIT 条，先截再筛会漏。
   const [range, setRange] = useState<UsageRange>(initialFocus.range ?? "all");
   const [relayFilter, setRelayFilter] = useState<{ id: string; label: string } | null>(
-    initialFocus.relayId ? { id: initialFocus.relayId, label: initialFocus.relayLabel || initialFocus.relayId } : null,
+    initialFocus.relayId !== undefined ? { id: initialFocus.relayId, label: initialFocus.relayLabel || initialFocus.relayId || t("未知") } : null,
   );
   const [modelFilter, setModelFilter] = useState(initialFocus.model ?? "");
   const [more, setMore] = useState(false);

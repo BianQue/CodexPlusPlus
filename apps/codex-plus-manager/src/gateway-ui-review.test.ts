@@ -327,6 +327,35 @@ test("用量与请求日志并成一页：两个页签各是一条路由，统�
   assert.match(read("GatewayPage.tsx"), /<TopbarActions>\{tab === "usage" \? null : refreshButton\}<\/TopbarActions>/, "用量页签只留一个刷新");
 });
 
+test("未知供应商保持空 ID 筛选，未指定供应商才不筛选", () => {
+  const app = read("App.tsx");
+  const screen = app.slice(app.indexOf("function RequestLogScreen("));
+  const initializer = screen.match(/const \[relayFilter, setRelayFilter\][^\n]*\(\r?\n\s*(.+),\r?\n\s*\);/);
+  const relayArg = screen.match(/^\s+relayId: (.+),\r?$/m);
+  assert.ok(initializer);
+  assert.ok(relayArg);
+  const selectRelay = new Function("initialFocus", "t", `
+    const relayFilter = ${initializer[1]};
+    return { relayFilter, relayId: ${relayArg[1]} };
+  `);
+  const t = (text: string) => text;
+  assert.deepEqual(selectRelay({ relayId: "", relayLabel: "" }, t), {
+    relayFilter: { id: "", label: "未知" }, relayId: "",
+  });
+  assert.deepEqual(selectRelay({ relayId: "relay-a", relayLabel: "供应商 A" }, t), {
+    relayFilter: { id: "relay-a", label: "供应商 A" }, relayId: "relay-a",
+  });
+  assert.deepEqual(selectRelay({ relayId: "relay-a" }, t), {
+    relayFilter: { id: "relay-a", label: "relay-a" }, relayId: "relay-a",
+  });
+  assert.deepEqual(selectRelay({}, t), { relayFilter: null, relayId: null });
+
+  const commands = read("../src-tauri/src/commands.rs");
+  const start = commands.indexOf("pub fn load_request_logs(");
+  const command = commands.slice(start, commands.indexOf("\n}", start));
+  assert.match(command, /RequestLogFilter\s*\{[^}]*\brelay_id\s*,/, "显式空 ID 必须原样交给核心筛选");
+});
+
 test("启动落在首页（赞助商推荐），不落在上次那个 Agent 的概览", () => {
   const app = read("App.tsx");
   const body = app.slice(app.indexOf("function loadInitialRoute(): Route {"), app.indexOf("function initialTourOpen"));

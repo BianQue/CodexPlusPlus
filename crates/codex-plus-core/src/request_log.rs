@@ -802,6 +802,7 @@ mod tests {
             (Some("claude"), "relay-a", "kimi-k2"),
             (Some("claude"), "relay-b", "Kimi-K2"),
             (Some("grok"), "relay-b", "glm-4.6"),
+            (Some("claude"), "", ""),
         ]
         .into_iter()
         .enumerate()
@@ -819,7 +820,7 @@ mod tests {
         let ids = |page: &RequestLogPage| page.entries.iter().map(|entry| entry.id.clone()).collect::<Vec<_>>();
 
         let all = read_request_log_page_at(&path, 10, &RequestLogFilter::default()).unwrap();
-        assert_eq!(ids(&all), vec!["e3", "e2", "e1", "e0"]);
+        assert_eq!(ids(&all), vec!["e4", "e3", "e2", "e1", "e0"]);
         assert!(!all.more);
         assert_eq!(all.oldest_ms, Some(1_000));
 
@@ -832,8 +833,14 @@ mod tests {
         let relay = RequestLogFilter { relay_id: Some("relay-b".to_string()), since_ms: Some(3_500), ..Default::default() };
         assert_eq!(ids(&read_request_log_page_at(&path, 10, &relay).unwrap()), vec!["e3"]);
 
+        let unknown_relay = RequestLogFilter {
+            relay_id: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(ids(&read_request_log_page_at(&path, 10, &unknown_relay).unwrap()), vec!["e4"]);
+
         let limited = read_request_log_page_at(&path, 2, &RequestLogFilter::default()).unwrap();
-        assert_eq!(ids(&limited), vec!["e3", "e2"]);
+        assert_eq!(ids(&limited), vec!["e4", "e3"]);
         assert!(limited.more, "符合条件的不止这些");
         assert_eq!(limited.oldest_ms, Some(1_000), "最早一条按整个文件算");
     }
