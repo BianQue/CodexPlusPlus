@@ -6,6 +6,7 @@
 import { PRESETS } from "./presets.ts";
 import { modelSlugFromRowName } from "./model-metadata.ts";
 import { normalizeSubscriptionPolicy, type SubscriptionPolicy, type SubscriptionPolicyInput } from "./subscription-policy.ts";
+import { providerHeaderInputs, providerHeaderRows, providerHeadersValidationMessage, type ProviderHeaderRow, type ProviderHeaderView } from "./relay-headers.ts";
 
 /** 内置三个之外，通用 Agent 的 id 由后端的规格表决定（如 "opencode"）。 */
 export type GatewayAgentId = "codex" | "claude" | "grok" | (string & {});
@@ -30,6 +31,10 @@ export type AgentBinding = {
   autoReviewModel?: string;
   /** 起名模型（Codex 用）：Codex 给会话起名的请求改发到这个模型；空或没有是不改（旧版后端没有）。 */
   titleModel?: string;
+  /** 压缩模型（#3142，Codex 用）：上下文压缩请求改发到这个模型；空或没有是跟随当前模型（旧版后端没有）。 */
+  compactionModel?: string;
+  /** 改发到压缩模型时用的推理强度；空或没有是沿用原请求。 */
+  compactionReasoningEffort?: string;
   contextWindow?: number | null;
   claudeEnableEffort: boolean;
   /** 这个 Agent 不用的池内供应商（「挑选」里取消勾选的）。 */
@@ -115,14 +120,18 @@ export type GatewayPoolEntry = {
   upstreamGone?: string[];
   /** 这个 ChatGPT 账号正借给 Codex 登录。 */
   lentToCodex?: boolean;
-  /** 订阅账号的剩余额度；查不到或普通供应商为空。 */
+  /** 订阅账号（或 OpenCode Go、Command Code 等套餐）的剩余额度；查不到或普通供应商为空。 */
   quota?: ProviderQuota | null;
+  /** 有额度可查（订阅账号，或按地址认出的 API Key 套餐，#3084）。旧版后端没有。 */
+  quotaApi?: boolean;
   /** 已保存的 Key（打码，#2782）：订阅账号等不用 Key 的为空。旧版后端没有。 */
   keys?: ProviderKeyView[];
   /** 有余额接口的厂商（DeepSeek、Kimi 等，#2793）：卡片用「用量」页同一份余额。旧版后端没有。 */
   balanceApi?: boolean;
   /** new-api 访问令牌（打码，#2793）：只用来查账户余额；没配置为空。令牌原文不出后端。 */
   newapiAccess?: NewApiAccessView | null;
+  /** 自定义请求头（#3075）：敏感头只有打码后的 `masked`；订阅账号等不开放编辑的为空。旧版后端没有。 */
+  customHeaders?: ProviderHeaderView[];
 };
 
 /** 已保存的 new-api 访问令牌：只有打码后的样子和用户 ID。 */
@@ -152,6 +161,8 @@ export type GatewayGroupEntry = {
   hideMembers?: boolean;
   /** 手动模式下选中的成员（成员的模型名）。 */
   pick?: string;
+  /** 图像输入模型（#3150）：请求带图片时改发给它；空表示跟随默认（图片能力取各成员交集）。 */
+  imageInputModel?: string;
 };
 
 /** 自动组：池里多家都有的模型各一个，`name` 是模型名，`id` 是 `auto:<小写模型名>`。 */
@@ -376,6 +387,8 @@ export type BindingDraft = {
   unknownModel: UnknownModelPolicy;
   autoReviewModel: string;
   titleModel: string;
+  compactionModel: string;
+  compactionReasoningEffort: string;
   contextWindow: string;
   claudeEnableEffort: boolean;
   poolExclude: string[];
@@ -407,6 +420,8 @@ export function draftFromBinding(binding: AgentBinding | undefined): BindingDraf
     unknownModel: source.unknownModel,
     autoReviewModel: source.autoReviewModel ?? "",
     titleModel: source.titleModel ?? "",
+    compactionModel: source.compactionModel ?? "",
+    compactionReasoningEffort: source.compactionReasoningEffort ?? "",
     contextWindow: source.contextWindow ? String(source.contextWindow) : "",
     claudeEnableEffort: source.claudeEnableEffort,
     poolExclude: [...(source.poolExclude ?? [])],
@@ -462,6 +477,37 @@ export const QUEUE_REASON_PREFIX = "local_rate_limit_wait_ms:";
  */
 export const FOREIGN_COMPACTION_DROPPED_REASON = "foreign_compaction_dropped";
 
+/** 请求日志「重试原因」里的说明（#3142）：这次压缩改发到了压缩模型，`compaction_model:<模型>`。 */
+export const COMPACTION_MODEL_REASON_PREFIX = "compaction_model:";
+/** 请求日志「重试原因」里的说明（#3142）：配了压缩模型但回退到原模型，`compaction_fallback:<原因>:<压缩模型>`。 */
+export const COMPACTION_FALLBACK_REASON_PREFIX = "compaction_fallback:";
+
+export type CompactionNote =
+  | { kind: "model"; model: string }
+  | { kind: "fallback"; reason: string; model: string };
+
+/** 解析压缩模型的说明；不是这类说明返回 null。 */
+export function parseCompactionNote(reason: string): CompactionNote | null {
+  if (reason.startsWith(COMPACTION_MODEL_REASON_PREFIX)) {
+    return { kind: "model", model: reason.slice(COMPACTION_MODEL_REASON_PREFIX.length) };
+  }
+  if (reason.startsWith(COMPACTION_FALLBACK_REASON_PREFIX)) {
+    const rest = reason.slice(COMPACTION_FALLBACK_REASON_PREFIX.length);
+    const at = rest.indexOf(":");
+    return at < 0 ? { kind: "fallback", reason: rest, model: "" } : { kind: "fallback", reason: rest.slice(0, at), model: rest.slice(at + 1) };
+  }
+  return null;
+}
+
+/** 这次请求的压缩模型说明（没有返回 null）。 */
+export function compactionNote(reasons: string[] | null | undefined): CompactionNote | null {
+  for (const reason of reasons ?? []) {
+    const note = parseCompactionNote(reason);
+    if (note) return note;
+  }
+  return null;
+}
+
 /** 这次请求是否去掉过别家签发的压缩上下文。 */
 export function foreignCompactionDropped(reasons: string[] | null | undefined): boolean {
   return (reasons ?? []).includes(FOREIGN_COMPACTION_DROPPED_REASON);
@@ -513,6 +559,8 @@ export function bindingFromDraft(draft: BindingDraft, previous: AgentBinding | u
     unknownModel: draft.unknownModel,
     autoReviewModel: draft.autoReviewModel.trim(),
     titleModel: draft.titleModel.trim(),
+    compactionModel: draft.compactionModel.trim(),
+    compactionReasoningEffort: draft.compactionReasoningEffort.trim(),
     contextWindow: window && Number.isFinite(window) ? window : null,
     claudeEnableEffort: draft.claudeEnableEffort,
     poolExclude: [...draft.poolExclude],
@@ -955,6 +1003,26 @@ export function parseWeight(text: string): number | null {
   return Math.max(1, Math.floor(value));
 }
 
+/** 「本地网关端口」（#3082）：与后端 `load_gateway_port` / `save_gateway_port` 的返回一致。 */
+export type GatewayPortInfo = {
+  configuredPort: number;
+  defaultPort: number;
+  envPort?: number | null;
+  runningPort?: number | null;
+  restartRequired: boolean;
+};
+
+export const MIN_GATEWAY_PORT = 1024;
+export const MAX_GATEWAY_PORT = 65535;
+
+/** 界面填的端口：只接受 1024–65535 的整数，其它返回 null（后端会再校验一次并检测占用）。 */
+export function parseGatewayPort(text: string): number | null {
+  const trimmed = text.trim();
+  if (!/^\d{1,5}$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return value >= MIN_GATEWAY_PORT && value <= MAX_GATEWAY_PORT ? value : null;
+}
+
 /** 通配符成员：带 `*`，按 `<供应商 id>/<模型>` 或裸模型名匹配池里现有的模型。 */
 export function isPattern(model: string): boolean {
   return model.includes("*");
@@ -993,6 +1061,17 @@ export function quotaWindowLabel(window: QuotaWindow): { text: string; args: num
   if (minutes % 1440 === 0) return { text: "{0} 天", args: [minutes / 1440] };
   if (minutes % 60 === 0) return { text: "{0} 小时", args: [minutes / 60] };
   return { text: "{0} 分钟", args: [minutes] };
+}
+
+/** 这家供应商有没有额度可查：后端按账号类型和地址判断（OpenCode Go、Command Code 等套餐也算，#3084）；
+ * 旧版后端没给标志时按账号类型：ChatGPT 订阅、Copilot、SuperGrok（ChatGPT API 账号按量计费，没有额度窗口）。 */
+export function quotaSupported(entry: GatewayPoolEntry): boolean {
+  return entry.quotaApi ?? (entry.account === "chatgpt" || entry.account === "copilot" || entry.account === "grok");
+}
+
+/** 「用量」页的额度一节：打开的、有额度可查的供应商（和供应商池卡片同一份缓存）。 */
+export function quotaEntries(pool: GatewayPoolEntry[] | undefined): GatewayPoolEntry[] {
+  return (pool ?? []).filter((entry) => entry.enabled !== false && quotaSupported(entry));
 }
 
 /** 已重置但未重新查询的窗口不假定恢复。 */
@@ -1075,6 +1154,25 @@ export function memberStatus(payload: GatewayPayload | null, relayId: string, no
     const quota = cooling.some((key) => key.lastFailure === "quota_exhausted");
     if (!left) return { state: "cooling", text: quota ? "额度耗尽" : "被限流", args: [] };
     return { state: "cooling", text: quota ? "额度耗尽 · {0} 后恢复" : "被限流 · {0} 后恢复", args: [left] };
+  }
+  // 冷却记录随进程消失；重新查到的官方窗口仍须参与状态，不能退回绿色套餐名。
+  if (entry?.account && entry.quota) {
+    const quota = entry.quota;
+    const maxAge = entry.subscriptionPolicy?.maxAgeSeconds ?? 600;
+    const exhausted = quota.windows.filter(window =>
+      quotaWindowFresh(quota, window, nowMs, maxAge) && window.usedPercent >= 100);
+    if (exhausted.length) {
+      const resets = exhausted.map(window => window.resetsAtMs).filter((reset): reset is number => reset !== null);
+      const left = resets.length === exhausted.length ? formatRemaining(Math.max(...resets) - nowMs) : "";
+      return left
+        ? { state: "cooling", text: "额度耗尽 · {0} 后恢复", args: [left] }
+        : { state: "cooling", text: "额度耗尽", args: [] };
+    }
+    const fresh = quota.updatedAtMs <= nowMs && nowMs - quota.updatedAtMs <= maxAge * 1000;
+    if (fresh && (quota.officialAllowed === false
+      || (quota.officialLimitReached === true && quota.officialAllowed !== true))) {
+      return { state: "cooling", text: "订阅额度受限", args: [] };
+    }
   }
   // 最近 10 分钟内由它回答过的 Agent 请求：显示「Codex 刚用过」。
   const answered = activity
@@ -1355,6 +1453,8 @@ export type ProviderDraft = {
   stripResponsesImageDetail?: boolean;
   /** 不向上游发送 `tool_search`：上游 400 时开启（#2868）。 */
   disableToolSearch?: boolean;
+  /** 自定义请求头（#3075）：测试、拉模型、实际请求都带上；不带表示不改。 */
+  customHeaders?: ProviderHeaderRow[];
 };
 
 const NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, disableToolSearch: false };
@@ -1390,6 +1490,7 @@ export function providerDraftFromEntry(entry: GatewayPoolEntry): ProviderDraft {
     subscriptionPolicy: entry.subscriptionPolicy == null ? entry.subscriptionPolicy : normalizeSubscriptionPolicy(entry.subscriptionPolicy),
     stripResponsesImageDetail: entry.stripResponsesImageDetail === true,
     disableToolSearch: entry.disableToolSearch === true,
+    customHeaders: providerHeaderRows(entry.customHeaders),
   };
 }
 
@@ -1409,6 +1510,7 @@ export function providerInput(draft: ProviderDraft) {
     ...(draft.subscriptionPolicy !== undefined ? { subscriptionPolicy: draft.subscriptionPolicy } : {}),
     stripResponsesImageDetail: draft.stripResponsesImageDetail === true,
     disableToolSearch: draft.disableToolSearch === true,
+    ...(draft.customHeaders !== undefined ? { customHeaders: providerHeaderInputs(draft.customHeaders) } : {}),
   };
 }
 
@@ -1443,7 +1545,7 @@ export function validateProviderDraft(draft: ProviderDraft, editing = false): st
   if (!/^https?:\/\/\S+$/i.test(draft.baseUrl.trim())) return "地址要以 http:// 或 https:// 开头";
   if (!editing && !draft.keys.trim()) return "请填写 API Key";
   if (!draft.model.trim() && splitModels(draft.modelList).length === 0) return "至少填一个模型";
-  return proxyAddressError(draft.proxy);
+  return proxyAddressError(draft.proxy) ?? providerHeadersValidationMessage(draft.customHeaders ?? []);
 }
 
 /* —————————————— 用量 —————————————— */

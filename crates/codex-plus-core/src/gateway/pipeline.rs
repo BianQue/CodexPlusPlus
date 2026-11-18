@@ -58,7 +58,7 @@ impl GatewayUpstream {
         }
     }
 
-    fn is_success(&self) -> bool {
+    pub(crate) fn is_success(&self) -> bool {
         self.status_code()
             .is_some_and(|status| (200..300).contains(&status))
     }
@@ -603,6 +603,11 @@ fn estimate_tokens(request: &GatewayRequest<'_>) -> u64 {
         .anthropic
         .as_ref()
         .map_or(&request.responses_body, |passthrough| passthrough.body);
+    estimate_body_tokens(body)
+}
+
+/// 同 [`estimate_tokens`]，直接按一个请求体估。
+pub(crate) fn estimate_body_tokens(body: &Value) -> u64 {
     text_bytes(body) / 4
 }
 
@@ -676,7 +681,12 @@ async fn attempt_pipeline(
             &candidate.upstream_model,
         );
         body["model"] = Value::String(candidate.upstream_model.clone());
-        crate::gateway::chatgpt_backend::adapt_request(&mut body, prompt.as_deref());
+        // WS 增量续接要保留续接 ID 与跨响应的工具配对（#3151）。
+        crate::gateway::chatgpt_backend::adapt_request_for_transport(
+            &mut body,
+            prompt.as_deref(),
+            crate::responses_websocket::active(),
+        );
         let version = crate::gateway::chatgpt_backend::codex_version(&home);
         relay.user_agent = crate::gateway::chatgpt_backend::codex_user_agent(&version);
         for (key, value) in [
@@ -709,7 +719,10 @@ async fn attempt_pipeline(
     if chatgpt_api {
         body["model"] = Value::String(candidate.upstream_model.clone());
         if shaping {
-            crate::gateway::chatgpt_backend::adapt_api_request(&mut body);
+            crate::gateway::chatgpt_backend::adapt_api_request_for_transport(
+                &mut body,
+                crate::responses_websocket::active(),
+            );
         }
         cache_key = body
             .get("prompt_cache_key")
@@ -874,6 +887,7 @@ fn conversation_seed(request: &GatewayRequest<'_>) -> Option<String> {
 /// 这些错误是请求内容本身不被支持（附件、加密内容、原生搜索、缺视觉配置），换上游也一样。
 fn is_request_rejection(error: &anyhow::Error) -> bool {
     error.is::<crate::responses_websocket::Unsupported>()
+        || error.is::<crate::responses_websocket::RequiresHttp>()
         || error
         .downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>()
         .is_some()

@@ -178,6 +178,119 @@ fn read_protocol_proxy_port_history(path: &std::path::Path) -> BTreeSet<u16> {
         .collect()
 }
 
+/// 界面里能填的最小端口（#3082）：1024 以下是特权端口，普通进程绑不上。
+pub const MIN_CUSTOM_PROTOCOL_PROXY_PORT: u16 = 1024;
+
+/// 管理器「本地网关端口」一行要显示的状态。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolProxyPortState {
+    /// 下次启动使用的端口：环境变量 > 持久化文件 > 默认值。
+    pub configured: u16,
+    /// 内置默认端口。
+    pub default_port: u16,
+    /// 设置了 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 时的值；此时界面不能改端口。
+    pub env_override: Option<u16>,
+}
+
+pub fn protocol_proxy_port_state() -> ProtocolProxyPortState {
+    protocol_proxy_port_state_at(
+        &persisted_protocol_proxy_port_path(),
+        env_protocol_proxy_port(),
+    )
+}
+
+fn protocol_proxy_port_state_at(
+    path: &std::path::Path,
+    env_override: Option<u16>,
+) -> ProtocolProxyPortState {
+    ProtocolProxyPortState {
+        configured: env_override
+            .or_else(|| read_persisted_protocol_proxy_port(path))
+            .unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT),
+        default_port: DEFAULT_PROTOCOL_PROXY_PORT,
+        env_override,
+    }
+}
+
+/// 校验界面填的端口：只接受 1024–65535。
+pub fn validate_custom_protocol_proxy_port(port: u32) -> anyhow::Result<u16> {
+    match u16::try_from(port) {
+        Ok(port) if port >= MIN_CUSTOM_PROTOCOL_PROXY_PORT => Ok(port),
+        _ => anyhow::bail!("端口要在 {MIN_CUSTOM_PROTOCOL_PROXY_PORT}–65535 之间，{port} 不可用。"),
+    }
+}
+
+/// 端口当前能不能给本地网关用：有人在监听、或系统禁止绑定（Windows 保留区间）都算不能用。
+pub fn ensure_loopback_port_free(port: u16) -> anyhow::Result<()> {
+    // 先连一下：macOS 上别人监听 0.0.0.0 时，带 SO_REUSEADDR 的 127.0.0.1 bind 仍可能成功。
+    if crate::ports::can_connect_loopback_port(port) {
+        anyhow::bail!("端口 {port} 已被其他程序占用，请换一个端口。");
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error) if crate::ports::port_bind_forbidden(&error) => {
+            anyhow::bail!("端口 {port} 在系统保留范围内，无法监听，请换一个端口。")
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            anyhow::bail!("端口 {port} 已被其他程序占用，请换一个端口。")
+        }
+        Err(error) => Err(error).with_context(|| format!("检测端口 {port} 失败")),
+    }
+}
+
+/// 在界面里改本地网关端口（#3082），写进持久化端口文件，下次启动 Codex++ 生效。
+///
+/// - 环境变量指定了端口时拒绝修改（环境变量优先，改了文件也不会生效）；
+/// - `running` 是本进程正在监听的端口：改回它不用检测占用（占着它的就是自己）；
+/// - 复用 [`persist_protocol_proxy_port`]，旧端口进历史，旧配置里的地址仍被认作受管地址。
+///
+/// 返回是否真的改了（填的就是当前端口时什么都不写）。
+pub fn set_custom_protocol_proxy_port(port: u32, running: Option<u16>) -> anyhow::Result<bool> {
+    let previous = protocol_proxy_port();
+    let changed = set_custom_protocol_proxy_port_at(
+        &persisted_protocol_proxy_port_path(),
+        port,
+        env_protocol_proxy_port(),
+        running,
+        ensure_loopback_port_free,
+    )?;
+    if changed {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "manager.protocol_proxy_port_changed",
+            serde_json::json!({ "from": previous, "to": port }),
+        );
+    }
+    Ok(changed)
+}
+
+fn set_custom_protocol_proxy_port_at(
+    path: &std::path::Path,
+    port: u32,
+    env_override: Option<u16>,
+    running: Option<u16>,
+    probe: impl Fn(u16) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    if let Some(env_port) = env_override {
+        anyhow::bail!(
+            "端口已由环境变量 CODEX_PLUS_PROTOCOL_PROXY_PORT 指定为 {env_port}，界面里改不了；请先去掉该环境变量。"
+        );
+    }
+    let port = validate_custom_protocol_proxy_port(port)?;
+    let current = read_persisted_protocol_proxy_port(path).unwrap_or(DEFAULT_PROTOCOL_PROXY_PORT);
+    if port == current {
+        return Ok(false);
+    }
+    if running != Some(port) {
+        probe(port)?;
+    }
+    persist_protocol_proxy_port(path, port)?;
+    Ok(true)
+}
+
 pub(crate) fn managed_protocol_proxy_base_urls() -> Vec<String> {
     let path = persisted_protocol_proxy_port_path();
     let mut ports = read_protocol_proxy_port_history(&path.with_file_name(PROTOCOL_PROXY_PORT_HISTORY_FILE));
@@ -186,6 +299,33 @@ pub(crate) fn managed_protocol_proxy_base_urls() -> Vec<String> {
     // 即使显式环境覆盖了当前端口，之前持久化的端口也仍是本工具写入过的值。
     ports.extend(read_persisted_protocol_proxy_port(&path));
     ports.into_iter().map(local_responses_proxy_base_url).collect()
+}
+
+/// 本地 WS 入口只能把 `response.create` 转给原生 Responses 上游；Chat Completions /
+/// Anthropic 兼容路由只能走 HTTP/SSE。混合协议池一律在握手阶段回 426，让客户端继续
+/// 用 HTTP，而不是升级成功后在路由阶段把整轮请求打成失败（#2963 的能力边界）。
+pub(crate) fn websocket_upgrade_serves_all_routes(
+    settings: &crate::settings::BackendSettings,
+) -> bool {
+    let native_responses = |relay: &crate::settings::RelayProfile| {
+        relay.protocol == crate::settings::RelayProtocol::Responses
+    };
+    if settings.relay_profiles_enabled
+        && !settings.relay_profiles.iter().all(native_responses)
+    {
+        return false;
+    }
+    // 网关成员各自有协议；池里只要有一位是 Chat / Anthropic，升级成功也可能在路由阶段失败。
+    let Ok(gateway) = crate::gateway::store::GatewayStore::default().load() else {
+        // 读不到网关配置时不能假定全部是原生 Responses，否则会把错误推迟到 101 之后。
+        return false;
+    };
+    gateway
+        .with_extension_providers()
+        .providers
+        .iter()
+        .filter(|provider| provider.enabled)
+        .all(|provider| native_responses(&provider.relay))
 }
 
 pub(crate) fn is_managed_protocol_proxy_base_url(value: &str) -> bool {
@@ -214,6 +354,102 @@ mod managed_port_history_tests {
             read_protocol_proxy_port_history(&dir.path().join(PROTOCOL_PROXY_PORT_HISTORY_FILE)),
             BTreeSet::from([58077, 58088, 58099]),
         );
+    }
+
+    fn free(_: u16) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn custom_port_validation_accepts_only_1024_to_65535() {
+        for bad in [0u32, 80, 1023, 65536, 70000] {
+            assert!(validate_custom_protocol_proxy_port(bad).is_err(), "{bad}");
+        }
+        assert_eq!(validate_custom_protocol_proxy_port(1024).unwrap(), 1024);
+        assert_eq!(validate_custom_protocol_proxy_port(65535).unwrap(), 65535);
+    }
+
+    #[test]
+    fn custom_port_is_persisted_and_old_ports_stay_managed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        std::fs::write(&path, "58077\n").unwrap();
+        assert!(set_custom_protocol_proxy_port_at(&path, 58123, None, Some(58077), free).unwrap());
+        assert_eq!(read_persisted_protocol_proxy_port(&path), Some(58123));
+        assert_eq!(protocol_proxy_port_state_at(&path, None).configured, 58123);
+        // 旧端口进历史：旧配置里 58077 的地址仍被认作本工具写入的受管地址。
+        assert_eq!(
+            read_protocol_proxy_port_history(&dir.path().join(PROTOCOL_PROXY_PORT_HISTORY_FILE)),
+            BTreeSet::from([58077, 58123]),
+        );
+    }
+
+    #[test]
+    fn custom_port_rejects_invalid_env_override_and_occupied_ports_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        assert!(set_custom_protocol_proxy_port_at(&path, 80, None, None, free).is_err());
+        let error = set_custom_protocol_proxy_port_at(&path, 58123, Some(59000), None, free)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CODEX_PLUS_PROTOCOL_PROXY_PORT"), "{error}");
+        let occupied = |port: u16| -> anyhow::Result<()> {
+            anyhow::bail!("端口 {port} 已被其他程序占用")
+        };
+        assert!(set_custom_protocol_proxy_port_at(&path, 58123, None, None, occupied).is_err());
+        assert!(!path.exists(), "校验失败不能写端口文件");
+        assert!(!dir.path().join(PROTOCOL_PROXY_PORT_HISTORY_FILE).exists());
+
+        let state = protocol_proxy_port_state_at(&path, Some(59000));
+        assert_eq!(state.configured, 59000);
+        assert_eq!(state.env_override, Some(59000));
+        assert_eq!(
+            protocol_proxy_port_state_at(&path, None).configured,
+            DEFAULT_PROTOCOL_PROXY_PORT
+        );
+    }
+
+    #[test]
+    fn custom_port_same_as_current_is_noop_and_running_port_skips_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PROTOCOL_PROXY_PORT_FILE);
+        let never = |_: u16| -> anyhow::Result<()> { panic!("不该检测占用") };
+        assert!(
+            !set_custom_protocol_proxy_port_at(
+                &path,
+                u32::from(DEFAULT_PROTOCOL_PROXY_PORT),
+                None,
+                None,
+                never
+            )
+            .unwrap()
+        );
+        assert!(!path.exists());
+        // 改到别处后再改回正在监听的端口：占着它的就是本进程，不检测占用。
+        set_custom_protocol_proxy_port_at(&path, 58200, None, None, free).unwrap();
+        assert!(
+            set_custom_protocol_proxy_port_at(
+                &path,
+                u32::from(DEFAULT_PROTOCOL_PROXY_PORT),
+                None,
+                Some(DEFAULT_PROTOCOL_PROXY_PORT),
+                never,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            read_persisted_protocol_proxy_port(&path),
+            Some(DEFAULT_PROTOCOL_PROXY_PORT)
+        );
+    }
+
+    #[test]
+    fn listening_port_is_reported_as_occupied() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = ensure_loopback_port_free(port).unwrap_err().to_string();
+        assert!(error.contains("占用"), "{error}");
+        drop(listener);
     }
 }
 
@@ -1041,7 +1277,8 @@ const COMPACTION_OUTPUT_TYPE: &str = "compaction";
 /// 后缀为 JSON string，不依赖客户端可能丢弃的 item id 或额外字段。
 const LOCAL_COMPACTION_PREFIX: &str = "codexplusplus:summary:v1:";
 /// 本地代理生成摘要时注入的 user 指令（对齐 openai/codex prompts/templates/compact/prompt.md）。
-const COMPACTION_SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.";
+/// Codex 内联压缩发的也是这段，网关按它认压缩请求（见 [`is_inline_compaction_request`]）。
+pub const COMPACTION_SUMMARY_INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.\n\nInclude:\n- Current progress and key decisions made\n- Important context, constraints, or user preferences\n- What remains to be done (clear next steps)\n- Any critical data, examples, or references needed to continue\n\nBe concise, structured, and focused on helping the next LLM seamlessly continue the work.";
 /// 历史回放时 `compaction` item 展开成的文本前缀（对齐 codex SUMMARY_PREFIX 语义）。
 const COMPACTION_REPLAY_PREFIX: &str = "Another language model started to solve this problem and produced a summary of its thinking process. Here is the summary produced by the other language model:\n";
 
@@ -1055,6 +1292,26 @@ pub fn request_has_compaction_trigger(body: &Value) -> bool {
                 item.get("type").and_then(Value::as_str) == Some(COMPACTION_TRIGGER_TYPE)
             })
         })
+}
+
+/// Codex 自己的内联压缩请求（非 OpenAI 供应商时）：普通 `/responses` 请求，
+/// 末尾是压缩提示词（或 turn 元数据标明 `request_kind: compaction`）。答复是普通的文字摘要。
+pub fn is_inline_compaction_request(body: &Value) -> bool {
+    !request_has_compaction_trigger(body)
+        && local_compaction::is_summary_request(body, COMPACTION_SUMMARY_INSTRUCTION)
+}
+
+/// input 里是否有上游签发的原生压缩项（不是 Codex++ 本地摘要）：这种密文只有签发它的那家读得懂。
+pub fn input_has_upstream_compaction(body: &Value) -> bool {
+    let upstream = |item: &Value| {
+        item.get("type").and_then(Value::as_str) == Some(COMPACTION_OUTPUT_TYPE)
+            && expand_compaction_item(item).is_none()
+    };
+    match body.get("input") {
+        Some(Value::Array(items)) => items.iter().any(upstream),
+        Some(input @ Value::Object(_)) => upstream(input),
+        _ => false,
+    }
 }
 
 /// 从请求 input 中剥离全部 compaction_trigger 控制项。
@@ -2904,6 +3161,12 @@ fn compaction_input_rejected(status_code: u16, body: &[u8]) -> bool {
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     }
     .to_ascii_lowercase();
+    // #3101：ChatGPT 订阅共享（「ChatGPT API」上游，api.openai.com + ChatGPT 登录）按白名单收输入项，
+    // compaction_trigger 不在其中；报错只列白名单、不点名被拒的项，只能按错误码认。
+    // 这里只用于带 trigger 的探测请求：若真正被拒的是历史里别的项，降级重发后上游会再报同样的错，原样交回。
+    if text.contains("subscription_sharing_unsupported_capability") {
+        return true;
+    }
     let unrecognized = text.contains("unknown")
         || text.contains("unrecognized")
         || text.contains("unsupported")
@@ -3842,7 +4105,7 @@ async fn open_responses_proxy_request_once(
         let has_more_candidates = attempt + 1 < relay_count;
         validate_upstream(&relay)?;
         if crate::responses_websocket::active() && relay.protocol != crate::settings::RelayProtocol::Responses {
-            return Err(crate::responses_websocket::Unsupported("此 WS 路径只支持原生 Responses 上游；HTTP/SSE 兼容路由请继续使用 HTTP").into());
+            return Err(crate::responses_websocket::RequiresHttp("此 WS 路径只支持原生 Responses 上游；HTTP/SSE 兼容路由请继续使用 HTTP").into());
         }
         // 官方登录成员：用该账号 OAuth 凭据发往 chatgpt.com，而不是 API Key。
         let official_member =
@@ -4134,7 +4397,7 @@ async fn open_responses_proxy_request_once(
         }
         if crate::responses_websocket::active() {
             if compaction || experimental_local_compaction || forced_adapted || local_exec_adapted {
-                return Err(crate::responses_websocket::Unsupported("此 WS 路径不执行 HTTP 压缩或 exec 协议转换，请继续使用 HTTP").into());
+                return Err(crate::responses_websocket::RequiresHttp("此 WS 路径不执行 HTTP 压缩或 exec 协议转换，请继续使用 HTTP").into());
             }
             let builder = build_responses_upstream_request(
                 &relay, &endpoint, &upstream_body, wire_api, false,
@@ -4174,7 +4437,7 @@ async fn open_responses_proxy_request_once(
                     // HTTP 200 不是升级成功，不能在网关中当成成功候选。
                     (None, Some(response), if (200..300).contains(&status) { 502 } else { status })
                 }
-                Err(error) if error.is::<crate::responses_websocket::Unsupported>() => return Err(error),
+                Err(error) if error.is::<crate::responses_websocket::Unsupported>() || error.is::<crate::responses_websocket::RequiresHttp>() => return Err(error),
                 Err(error) => {
                     if !strict_aggregate_model { crate::relay_rotation::record_relay_request_failure(&settings); }
                     if has_more_candidates {
@@ -12963,7 +13226,7 @@ pub(crate) struct ResponsesSseTransformer {
     apply_patch_declared_as_function: bool,
     /// 从 `response.completed` 里抓到的 usage，供请求日志使用。
     usage: Option<crate::request_log::RequestUsage>,
-    final_response_usage: Option<crate::request_log::RequestUsage>,
+    final_response_usage: Option<crate::request_log::FinalResponseUsage>,
     final_response_invalid: bool,
     /// 终态失败事件里的 code/message 摘要。只进请求日志与诊断日志，
     /// 不拼进 failure 原因（原因会随 SSE 回给客户端，不能泄露上游 payload）。
@@ -13265,7 +13528,7 @@ impl ResponsesSseTransformer {
         self.usage.take()
     }
 
-    pub(crate) fn final_response_usage(&self) -> Option<crate::request_log::RequestUsage> {
+    pub(crate) fn final_response_usage(&self) -> Option<crate::request_log::FinalResponseUsage> {
         (self.completed
             && !self.failed
             && !self.final_response_invalid
@@ -13988,7 +14251,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
             final_stream.push_bytes(chunk);
         }
         assert_eq!(
-            final_stream.final_response_usage().unwrap().input_tokens,
+            final_stream.final_response_usage().unwrap().usage.input_tokens,
             12
         );
         assert!(final_stream.finish().is_none());
@@ -14010,7 +14273,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         let mut done = ResponsesSseTransformer::default();
         done.push_bytes(completed);
         done.push_bytes(b"data: [DONE]\n\n");
-        assert_eq!(done.final_response_usage().unwrap().input_tokens, 12);
+        assert_eq!(done.final_response_usage().unwrap().usage.input_tokens, 12);
         for body in [
             &completed[..completed.len() - 2],
             &b"data: [DONE]\n\n"[..],
@@ -14037,6 +14300,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
             returned_attempt
                 .final_response_usage()
                 .unwrap()
+                .usage
                 .input_tokens,
             12
         );
