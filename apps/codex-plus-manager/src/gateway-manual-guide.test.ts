@@ -52,7 +52,7 @@ test("重新生成 API Key 先确认；托盘对手动接入只显示状态", ()
   const guide = read("GatewayManualGuide.tsx");
   assert.match(guide, /if \(await confirmRegenerate\(agent\.name\)\) \{\s*await run\([^)]*"rotate_gateway_token"/);
   const page = read("GatewayPage.tsx");
-  assert.match(page, /if \(agent\.manual && !\(await confirmRegenerate\(agent\.name\)\)\) return;/);
+  assert.match(page, /manual \? await confirmRegenerate\(name\) : await appConfirm\(/);
   const tray = read("TrayPanel.tsx");
   assert.match(tray, /agent\.manual\s*\? <PanelManualAgentRow/);
 });

@@ -2,6 +2,7 @@
  * 两个页签各是一条路由（gatewayUsage / requestLog），侧栏里只有一个「用量」入口。 */
 import { t } from "./i18n";
 import type { UsageRange } from "./gateway-model";
+import { onTabListKeyDown } from "./tablist-keys";
 
 export type UsageRoute = "gatewayUsage" | "requestLog";
 
@@ -10,6 +11,8 @@ export type RequestLogFocus = {
   agent?: "codex" | "claude" | "grok";
   relayId?: string;
   relayLabel?: string;
+  /** 点的是「未知」供应商行（请求没有供应商归属）；relayId 为空时靠它区分于「全部供应商」。 */
+  relayUnknown?: boolean;
   model?: string;
   range?: UsageRange;
 };
@@ -32,9 +35,9 @@ export function UsageTabs({ value, onChange }: { value: UsageRoute; onChange: (n
     { id: "requestLog", label: t("请求") },
   ];
   return (
-    <nav aria-label={t("用量")} className="tp-tabs usage-tabs" role="tablist">
+    <nav aria-label={t("用量")} className="tp-tabs usage-tabs" onKeyDown={onTabListKeyDown} role="tablist">
       {tabs.map((tab) => (
-        <button aria-selected={value === tab.id} data-active={value === tab.id} key={tab.id} onClick={() => onChange(tab.id)} role="tab" type="button">
+        <button aria-selected={value === tab.id} data-active={value === tab.id} key={tab.id} onClick={() => onChange(tab.id)} role="tab" tabIndex={value === tab.id ? 0 : -1} type="button">
           {tab.label}
         </button>
       ))}

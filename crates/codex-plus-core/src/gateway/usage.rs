@@ -461,6 +461,7 @@ mod tests {
                 input_tokens: input,
                 output_tokens: output,
                 cached_tokens: cached,
+                cached_tokens_known: true,
                 reasoning_tokens: 1,
             }),
             cache_hit_ratio: None,

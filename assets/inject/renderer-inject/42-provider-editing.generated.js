@@ -25,6 +25,7 @@ var codexPlusProviderEditing = (() => {
     CHAT_UPSTREAM_BASE_URL_KEY: () => CHAT_UPSTREAM_BASE_URL_KEY,
     activeRelayProfile: () => activeRelayProfile,
     addRelayProfile: () => addRelayProfile,
+    aggregateMemberCandidates: () => aggregateMemberCandidates,
     aggregateProfileForMode: () => aggregateProfileForMode,
     aggregateRelayProfileValidation: () => aggregateRelayProfileValidation,
     aggregateStrategyHelp: () => aggregateStrategyHelp,
@@ -35,6 +36,7 @@ var codexPlusProviderEditing = (() => {
     buildOfficialRelayAuthJson: () => buildOfficialRelayAuthJson,
     buildRelayAuthJson: () => buildRelayAuthJson,
     buildRelayConfigToml: () => buildRelayConfigToml,
+    clampAggregateRoutePriority: () => clampAggregateRoutePriority,
     clampAggregateWeight: () => clampAggregateWeight,
     codexApiKeyFromAuth: () => codexApiKeyFromAuth,
     codexBaseUrlFromConfig: () => codexBaseUrlFromConfig,
@@ -56,6 +58,7 @@ var codexPlusProviderEditing = (() => {
     gatewaySafety: () => gateway_agent_safety_exports,
     hydrateAggregateRelayProfile: () => hydrateAggregateRelayProfile,
     isAggregateRelayProfile: () => isAggregateRelayProfile,
+    isOfficialLoginMemberProfile: () => isOfficialLoginMemberProfile,
     joinTomlSections: () => joinTomlSections,
     normalizeAggregateConfig: () => normalizeAggregateConfig,
     normalizeAggregateProfilesFromRelayProfiles: () => normalizeAggregateProfilesFromRelayProfiles,
@@ -81,6 +84,7 @@ var codexPlusProviderEditing = (() => {
     relaySessionProviderFromConfig: () => relaySessionProviderFromConfig,
     relaySessionProviderValidation: () => relaySessionProviderValidation,
     relaySettingsValidation: () => relaySettingsValidation,
+    relaySettingsValidationForSave: () => relaySettingsValidationForSave,
     relaySettingsWithDraft: () => relaySettingsWithDraft,
     removeCodexExperimentalBearerToken: () => removeCodexExperimentalBearerToken,
     removeRelayProfile: () => removeRelayProfile,
@@ -284,6 +288,9 @@ var codexPlusProviderEditing = (() => {
   function stripResponsesImageDetailEnabled(profile) {
     return profile.stripResponsesImageDetail === true && profile.protocol === "responses" && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
   }
+  function stripResponsesOutputEncryptedContentEnabled(profile) {
+    return profile.stripResponsesOutputEncryptedContent === true && profile.protocol === "responses" && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
+  }
   function pureApiImageGenerationEnabled(profile) {
     return profile.pureApiImageGeneration === true && profile.relayMode === "pureApi";
   }
@@ -406,7 +413,7 @@ var codexPlusProviderEditing = (() => {
   function buildRelayConfigToml(profile, options) {
     const searchHistoryCompat = profile.webSearchHistoryCompat === true && profile.protocol === "responses" && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
     const localCompaction = profile.localCompactionPromptAtEnd === true && (profile.protocol === "responses" || profile.protocol === "chatCompletions") && profile.relayMode !== "aggregate" && (profile.relayMode !== "official" || profile.officialMixApiKey);
-    const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || pureApiImageGenerationEnabled(profile) ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+    const baseUrl = profile.protocol !== "responses" || independentProxyEnabled(profile) || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(profile) || stripImageGenerationToolEnabled(profile) || stripResponsesImageDetailEnabled(profile) || stripResponsesOutputEncryptedContentEnabled(profile) || pureApiImageGenerationEnabled(profile) ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
     const apiKey = profile.apiKey.trim();
     const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
     const rootLines = [
@@ -494,6 +501,15 @@ var codexPlusProviderEditing = (() => {
     const compatibleSession = sessionProviderForProtocol(sessionProvider, protocol);
     const normalizedPatch = compatibleSession === sessionProvider ? patch : { ...patch, sessionProvider: compatibleSession };
     let next = { ...profile, ...normalizedPatch };
+    if (profile.relayMode === "official" && profile.officialMixApiKey && next.relayMode === "official" && !next.officialMixApiKey) {
+      next.inactiveMixedApi = {
+        configContents: profile.configContents || withGeneratedRelayFiles(profile).configContents,
+        upstreamBaseUrl: profile.upstreamBaseUrl || profile.baseUrl,
+        modelRoutes: profile.modelRoutes
+      };
+    } else if (profile.relayMode === "official" && !profile.officialMixApiKey && next.officialMixApiKey && profile.inactiveMixedApi) {
+      next = { ...next, ...profile.inactiveMixedApi, inactiveMixedApi: void 0 };
+    }
     if (isAggregateRelayProfile(next)) {
       return normalizeAggregateRelayProfile(next, null);
     }
@@ -527,10 +543,10 @@ var codexPlusProviderEditing = (() => {
     if ("upstreamBaseUrl" in patch) {
       next.baseUrl = patch.upstreamBaseUrl || "";
     }
-    if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
+    if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "webSearchHistoryCompat" in patch || "localCompactionPromptAtEnd" in patch || "strictResponsesReasoning" in patch || "stripImageGenerationTool" in patch || "stripResponsesImageDetail" in patch || "stripResponsesOutputEncryptedContent" in patch || "pureApiImageGeneration" in patch || "modelMetadata" in patch) {
       const searchHistoryCompat = next.webSearchHistoryCompat === true && next.protocol === "responses" && next.relayMode !== "aggregate" && (next.relayMode !== "official" || next.officialMixApiKey);
       const localCompaction = next.localCompactionPromptAtEnd === true && (next.protocol === "responses" || next.protocol === "chatCompletions") && next.relayMode !== "aggregate" && (next.relayMode !== "official" || next.officialMixApiKey);
-      const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || pureApiImageGenerationEnabled(next) ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
+      const baseUrlForConfig = next.protocol !== "responses" || independentProxyEnabled(next) || normalizeRelayModelRoutes(next.modelRoutes).length > 0 || searchHistoryCompat || localCompaction || requestCompatibilityEnabled(next) || stripImageGenerationToolEnabled(next) || stripResponsesImageDetailEnabled(next) || stripResponsesOutputEncryptedContentEnabled(next) || pureApiImageGenerationEnabled(next) ? PROTOCOL_PROXY_BASE_URL : next.upstreamBaseUrl || next.baseUrl;
       next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {
         requiresOpenAiAuth: next.relayMode !== "pureApi"
       });
@@ -975,6 +991,20 @@ ${key} = ${value}`]);
       if (sessionProviderError) return sessionProviderError;
     }
     return relayModelRoutesSettingsValidation(settings);
+  }
+  function relaySettingsValidationForSave(settings, editingId) {
+    const named = (profileId, message) => {
+      if (profileId === editingId) return message;
+      const other = settings.relayProfiles.find((profile) => profile.id === profileId);
+      return tf("供应商「{0}」配置有误：{1}", [other?.name || t("未命名供应商"), message]);
+    };
+    for (const profile of settings.relayProfiles) {
+      const sessionProviderError = relaySessionProviderValidation(profile);
+      if (sessionProviderError) return named(profile.id, sessionProviderError);
+    }
+    const routeIssue = findRelayModelRouteIssue(settings.relayProfiles, settings.relayProfiles);
+    const routeMessage = relayModelRouteIssueMessage(routeIssue);
+    return routeIssue && routeMessage ? named(routeIssue.sourceRelayId, routeMessage) : null;
   }
   function relaySessionProviderValidation(profile) {
     if (relaySessionProvider(profile) === "openai" && profile.protocol !== "responses") {
@@ -1614,6 +1644,7 @@ ${key} = ${value}`]);
       strictResponsesReasoning: profile.strictResponsesReasoning === true,
       stripImageGenerationTool: profile.stripImageGenerationTool === true,
       stripResponsesImageDetail: profile.stripResponsesImageDetail === true,
+      stripResponsesOutputEncryptedContent: profile.stripResponsesOutputEncryptedContent === true,
       disableToolSearch: profile.disableToolSearch === true,
       pureApiImageGeneration: profile.pureApiImageGeneration === true,
       anthropicAuthHeader: normalizeAnthropicAuthHeader(profile.anthropicAuthHeader),
@@ -1637,19 +1668,20 @@ ${key} = ${value}`]);
     GATEWAY_AGENT_NAMES: () => GATEWAY_AGENT_NAMES,
     GATEWAY_CLAUDE_PROVIDER_ID: () => GATEWAY_CLAUDE_PROVIDER_ID,
     GROUP_MODEL_PREFIX: () => GROUP_MODEL_PREFIX,
+    MAGPIE_UPSTREAM_ID: () => MAGPIE_UPSTREAM_ID,
     MANUAL_WIRE_LABELS: () => MANUAL_WIRE_LABELS,
     MAX_GATEWAY_PORT: () => MAX_GATEWAY_PORT,
     MIN_GATEWAY_PORT: () => MIN_GATEWAY_PORT,
     QUEUE_REASON_PREFIX: () => QUEUE_REASON_PREFIX,
     RECENT_USE_MS: () => RECENT_USE_MS,
-    SPONSORS: () => SPONSORS,
     activeAutoGroup: () => activeAutoGroup,
-    activeSponsorIds: () => activeSponsorIds,
     agentModels: () => agentModels,
     agentName: () => agentName,
     agentPoolProviders: () => agentPoolProviders,
+    appendGroupMembers: () => appendGroupMembers,
     averageDuration: () => averageDuration,
     axisLabelIndexes: () => axisLabelIndexes,
+    batchMemberRows: () => batchMemberRows,
     bindingFromDraft: () => bindingFromDraft,
     blankBinding: () => blankBinding,
     cacheHitRate: () => cacheHitRate,
@@ -1703,6 +1735,7 @@ ${key} = ${value}`]);
     parseWeight: () => parseWeight,
     patternMatches: () => patternMatches,
     pendingImportCount: () => pendingImportCount,
+    pendingImports: () => pendingImports,
     pickerSections: () => pickerSections,
     poolExcludeToggle: () => poolExcludeToggle,
     presetAdded: () => presetAdded,
@@ -1723,11 +1756,14 @@ ${key} = ${value}`]);
     quotaWindowFresh: () => quotaWindowFresh,
     quotaWindowLabel: () => quotaWindowLabel,
     relativeTime: () => relativeTime,
+    relayFilterArgs: () => relayFilterArgs,
+    relayFilterFromFocus: () => relayFilterFromFocus,
     rememberAgentNames: () => rememberAgentNames,
     routeNarrative: () => routeNarrative,
     servingProviders: () => servingProviders,
     shortDate: () => shortDate,
     shortPath: () => shortPath,
+    shortProviderName: () => shortProviderName,
     skippedAgents: () => skippedAgents,
     slugify: () => slugify,
     speedOf: () => speedOf,
@@ -1882,28 +1918,7 @@ ${key} = ${value}`]);
       modelList: ["LongCat-Flash-Chat"],
       websiteUrl: "https://longcat.chat/platform"
     },
-    // ── 聚合/中转 ──
-    {
-      id: "jojocode-max",
-      name: "JOJO Code",
-      websiteUrl: "https://max2.jojocode.com/",
-      apiKeyUrl: "https://max2.jojocode.com/",
-      category: "aggregator",
-      baseUrl: "https://max2.jojocode.com/v1",
-      protocol: "responses",
-      // 模型留空：添加时「从上游获取」或手填。
-      model: ""
-    },
-    {
-      id: "runapi",
-      name: "RunAPI",
-      websiteUrl: "https://runapi.host",
-      apiKeyUrl: "https://runapi.host",
-      category: "aggregator",
-      baseUrl: "https://runapi.host/v1",
-      protocol: "responses",
-      model: "gpt-5.5"
-    },
+    // ── 聚合/中转（赞助商不在这里，见 sponsorPresets）──
     {
       id: "siliconflow",
       name: "SiliconFlow",
@@ -1933,38 +1948,6 @@ ${key} = ${value}`]);
       protocol: "responses",
       model: "gpt-5.5",
       websiteUrl: "https://aihubmix.com"
-    },
-    {
-      id: "apikeyfun",
-      name: "APIKEY.FUN",
-      category: "aggregator",
-      baseUrl: "https://api.apikey.fun/v1",
-      protocol: "responses",
-      model: "gpt-5.5",
-      modelList: ["gpt-5.5"],
-      websiteUrl: "https://apikey.fun"
-    },
-    {
-      id: "cccccc-api",
-      name: "ccccccAPI",
-      websiteUrl: "https://dzhsmartai.com",
-      apiKeyUrl: "https://dzhsmartai.com/register?promo=CODEXPLUSPLUS",
-      category: "aggregator",
-      baseUrl: "https://dzhsmartai.com/v1",
-      protocol: "responses",
-      // 模型留空：添加时「从上游获取」或手填。
-      model: ""
-    },
-    {
-      id: "tokenmy",
-      name: "TokenMy",
-      websiteUrl: "https://agent.tokenmy.ai",
-      apiKeyUrl: "https://agent.tokenmy.ai",
-      category: "aggregator",
-      baseUrl: "https://agent.tokenmy.ai/v1",
-      protocol: "responses",
-      // 模型留空：添加时「从上游获取」或手填。
-      model: ""
     },
     {
       id: "novita",
@@ -2266,12 +2249,12 @@ ${key} = ${value}`]);
   }
   function validateDraft(draft, payload, retainedModel, retainedSelection) {
     if (payload) {
-      if (!agentPoolProviders(payload, draft.poolExclude).length) return "供应商池是空的，先到「供应商」里添加";
+      if (!agentPoolProviders(payload, draft.poolExclude).length) return "共享供应商是空的，先在「共享供应商」里添加供应商";
       const model = draft.model.trim();
       const retainedDisabledModel = draft.model === retainedModel && disabledGroup(payload, model);
       const retainedProvider = retainedSelection && payload.pool.find((entry) => entry.id === retainedSelection.providerId);
       const retainedUnavailableModel = draft.model === retainedModel && retainedSelection && modelSlugFromRowName(model).toLowerCase() === `${retainedSelection.providerId}/${modelSlugFromRowName(retainedSelection.upstreamModel)}`.toLowerCase() && (retainedSelection.providerRemoved || !retainedProvider || !providerEnabled(retainedProvider) || draft.poolExclude.includes(retainedProvider.id));
-      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude)) return "供应商池里没有这个模型";
+      if (model && !retainedDisabledModel && !retainedUnavailableModel && !modelRoutable(payload, model, draft.poolExclude)) return "共享供应商里没有这个模型";
     }
     const window = parseContextWindow(draft.contextWindow);
     if (window !== null && (!Number.isFinite(window) || window < 1e3)) return "上下文窗口格式不对，例如 200000、200k 或 1M";
@@ -2803,38 +2786,29 @@ ${key} = ${value}`]);
       defaultKey: "lm-studio"
     }
   ];
-  var SPONSORS = [
-    { id: "jojocode-max", expiresAt: "2029-06-15" },
-    { id: "runapi", expiresAt: "2026-12-07" },
-    { id: "apikeyfun", expiresAt: "2026-11-22" },
-    { id: "cccccc-api", expiresAt: "2026-12-01" },
-    { id: "tokenmy", expiresAt: "2026-11-20" }
-  ];
-  function localDay(now) {
-    const pad = (value) => String(value).padStart(2, "0");
-    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-  }
-  function activeSponsorIds(now = /* @__PURE__ */ new Date()) {
-    const today = localDay(now);
-    return SPONSORS.filter((sponsor) => sponsor.expiresAt >= today).map((sponsor) => sponsor.id);
-  }
-  function gatewayPresets(now = /* @__PURE__ */ new Date()) {
-    const sponsorIds = activeSponsorIds(now);
-    const expired = new Set(SPONSORS.map((sponsor) => sponsor.id).filter((id) => !sponsorIds.includes(id)));
-    const shared = PRESETS.filter((preset) => !expired.has(preset.id)).map((preset) => ({
+  function toGatewayPreset(preset, section) {
+    return {
       key: preset.id,
       name: preset.name,
       baseUrl: preset.baseUrl,
       protocol: preset.protocol,
       model: preset.model,
       modelList: preset.modelList ?? (preset.model ? [preset.model] : []),
-      section: sponsorIds.includes(preset.id) ? "sponsor" : preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay",
+      section,
       apiKeyUrl: preset.apiKeyUrl
-    }));
+    };
+  }
+  function gatewayPresets(sponsors = []) {
+    const sponsorIds = new Set(sponsors.map((preset) => preset.id));
+    const shared = PRESETS.filter((preset) => !sponsorIds.has(preset.id)).map((preset) => toGatewayPreset(preset, preset.category === "official" || preset.category === "cn_official" ? "vendor" : "relay"));
     const vendors = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "vendor"), ...shared.filter((preset) => preset.section === "vendor")];
     const relays = [...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "relay"), ...shared.filter((preset) => preset.section === "relay")];
-    const sponsors = sponsorIds.flatMap((id) => shared.filter((preset) => preset.key === id));
-    return [...sponsors, ...vendors, ...relays, ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")];
+    return [
+      ...sponsors.map((preset) => toGatewayPreset(preset, "sponsor")),
+      ...vendors,
+      ...relays,
+      ...GATEWAY_EXTRA_PRESETS.filter((preset) => preset.section === "local")
+    ];
   }
   function normalizeUrl(url) {
     return url.trim().replace(/\/+$/, "").toLowerCase();
@@ -2851,7 +2825,7 @@ ${key} = ${value}`]);
     const target = normalizeUrl(preset.baseUrl);
     return Boolean(payload?.pool.some((entry) => entry.source === `preset:${preset.key}` || normalizeUrl(entry.baseUrl) === target));
   }
-  var NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, disableToolSearch: false };
+  var NO_PRICE = { priceCurrency: "CNY", priceInput: "", priceCached: "", priceOutput: "", proxy: "", stripImageGenerationTool: false, stripResponsesImageDetail: false, stripResponsesOutputEncryptedContent: false, disableToolSearch: false };
   function providerDraftFromPreset(preset) {
     if (!preset) return { name: "", baseUrl: "", keys: "", protocol: "chatCompletions", model: "", modelList: "", ...NO_PRICE };
     return {
@@ -2880,6 +2854,7 @@ ${key} = ${value}`]);
       stripImageGenerationTool: entry.stripImageGenerationTool === true,
       subscriptionPolicy: entry.subscriptionPolicy == null ? entry.subscriptionPolicy : normalizeSubscriptionPolicy(entry.subscriptionPolicy),
       stripResponsesImageDetail: entry.stripResponsesImageDetail === true,
+      stripResponsesOutputEncryptedContent: entry.stripResponsesOutputEncryptedContent === true,
       disableToolSearch: entry.disableToolSearch === true,
       customHeaders: providerHeaderRows(entry.customHeaders)
     };
@@ -2898,6 +2873,7 @@ ${key} = ${value}`]);
       stripImageGenerationTool: draft.stripImageGenerationTool === true,
       ...draft.subscriptionPolicy !== void 0 ? { subscriptionPolicy: draft.subscriptionPolicy } : {},
       stripResponsesImageDetail: draft.stripResponsesImageDetail === true,
+      stripResponsesOutputEncryptedContent: draft.stripResponsesOutputEncryptedContent === true,
       disableToolSearch: draft.disableToolSearch === true,
       ...draft.customHeaders !== void 0 ? { customHeaders: providerHeaderInputs(draft.customHeaders) } : {}
     };
@@ -2932,6 +2908,13 @@ ${key} = ${value}`]);
     const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     start.setDate(start.getDate() - (days - 1));
     return start.getTime();
+  }
+  function relayFilterFromFocus(focus) {
+    if (focus.relayUnknown) return { id: "", label: focus.relayLabel || "", unknown: true };
+    return focus.relayId ? { id: focus.relayId, label: focus.relayLabel || focus.relayId } : null;
+  }
+  function relayFilterArgs(filter) {
+    return filter?.unknown ? { relayId: null, relayUnknown: true } : { relayId: filter?.id || null, relayUnknown: false };
   }
   function formatRequestCost(cost) {
     if (cost.amount <= 0) return "—";
@@ -3024,6 +3007,9 @@ ${key} = ${value}`]);
   function maskEmailsIn(text) {
     return text.replace(EMAIL_PATTERN, (_match, lead, email) => lead + maskEmail(email));
   }
+  function shortProviderName(name) {
+    return name.split("·")[0].trim() || name;
+  }
   function maskAccountName(name) {
     const masked = maskEmailsIn(name);
     const match = /^((?:ChatGPT|Copilot|SuperGrok|GitHub Copilot)[^·]*·\s*)(.+)$/.exec(masked);
@@ -3049,12 +3035,28 @@ ${key} = ${value}`]);
       ...plain("codex", payload?.codexProviders),
       ...(payload?.codexAggregates ?? []).map((item) => ({ source: "aggregate", id: item.id, name: item.name, imported: item.imported })),
       ...plain("claude", payload?.claudeProviders),
+      ...plain("ccswitch", payload?.ccSwitchClaude),
+      ...plain("claudemom", payload?.claudeMomProfiles),
+      ...plain("magpie", payload?.magpieProviders),
       ...plain("grok", payload?.grokProfiles),
       ...plain("opencode", payload?.opencodeKeys)
     ];
   }
+  var MAGPIE_UPSTREAM_ID = "@gateway";
+  function pendingImports(payload) {
+    const candidates = importCandidates(payload);
+    const magpie = candidates.filter((item) => item.source === "magpie");
+    const magpieDone = magpie.some((item) => item.imported);
+    const upstream = magpie.find((item) => item.id === MAGPIE_UPSTREAM_ID);
+    return candidates.filter((item) => {
+      if (item.imported) return false;
+      if (item.source !== "magpie") return true;
+      if (magpieDone) return false;
+      return upstream ? item === upstream : true;
+    });
+  }
   function pendingImportCount(payload) {
-    return importCandidates(payload).filter((item) => !item.imported).length;
+    return pendingImports(payload).length;
   }
   function pinnedBare(payload, model) {
     const slash = model.indexOf("/");
@@ -3110,6 +3112,37 @@ ${key} = ${value}`]);
     if (qualified) return qualified;
     const serving = servingProviders(payload, model);
     return serving.length === 1 ? { entry: serving[0], model: model.trim() } : null;
+  }
+  function batchMemberRows(payload, members) {
+    const taken = /* @__PURE__ */ new Set();
+    for (const member of members) {
+      const target = memberTarget(payload, member.model);
+      if (target) taken.add(`${target.entry.id}/${target.model}`.toLowerCase());
+    }
+    return modelDispatch(payload).map((row) => {
+      const pinned = row.providers.length > 1 || Boolean(disabledGroup(payload, row.model));
+      return {
+        model: row.model,
+        candidates: row.providers.map((provider) => ({
+          providerId: provider.id,
+          name: provider.name,
+          baseUrl: provider.baseUrl,
+          member: pinned ? `${provider.id}/${row.model}` : row.model,
+          added: taken.has(`${provider.id}/${row.model}`.toLowerCase())
+        }))
+      };
+    });
+  }
+  function appendGroupMembers(members, models) {
+    const seen = new Set(members.map((member) => member.model.toLowerCase()));
+    const next = [...members];
+    for (const model of models) {
+      const key = model.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      next.push({ model, weight: 1 });
+    }
+    return next;
   }
 
   // apps/codex-plus-manager/src/gateway-agent-safety.ts
@@ -3169,13 +3202,13 @@ ${key} = ${value}`]);
   }
   function diagnosticEvidenceLabel(code) {
     const labels = {
-      matches: "与网关配置一致",
-      matched: "与网关配置一致",
+      matches: "与本地服务配置一致",
+      matched: "与本地服务配置一致",
       missing: "配置项缺失",
       missingFile: "文件不存在",
       missing_file: "文件不存在",
       changed: "配置项已改变",
-      mismatch: "与网关配置不符",
+      mismatch: "与本地服务配置不符",
       endpointChanged: "地址已改变",
       endpoint_changed: "地址已改变",
       unreadable: "无法读取",
@@ -3185,21 +3218,21 @@ ${key} = ${value}`]);
       credential_changed: "本地凭据已改变",
       credentialMissing: "本地凭据缺失",
       credential_missing: "本地凭据缺失",
-      endpointMatched: "与网关配置一致",
-      endpointPortMismatch: "端口与网关配置不符",
-      endpointHostMismatch: "主机与网关配置不符",
-      endpointPathMismatch: "路径与网关配置不符",
+      endpointMatched: "与本地服务配置一致",
+      endpointPortMismatch: "端口与本地服务配置不符",
+      endpointHostMismatch: "主机与本地服务配置不符",
+      endpointPathMismatch: "路径与本地服务配置不符",
       endpointMissing: "地址缺失",
       selectionChanged: "当前供应商或模型已改变",
       fileMissing: "文件不存在",
       fileUnreadable: "无法读取",
       invalidConfig: "配置格式无效",
       unsupportedConfig: "此配置暂无法验证",
-      endpoint_match: "与网关配置一致",
-      credential_match: "与网关配置一致",
+      endpoint_match: "与本地服务配置一致",
+      credential_match: "与本地服务配置一致",
       credential_sealed: "凭据已由系统安全存储加密保存",
-      selection_match: "与网关配置一致",
-      managed_config_match: "与网关配置一致",
+      selection_match: "与本地服务配置一致",
+      managed_config_match: "与本地服务配置一致",
       config_missing: "配置缺失",
       config_unreadable: "无法读取",
       config_invalid: "配置格式无效",
@@ -3207,9 +3240,9 @@ ${key} = ${value}`]);
       unsupported_agent: "此 Agent 暂无法验证",
       endpoint_missing: "地址缺失",
       endpoint_invalid: "地址格式无效",
-      endpoint_host_mismatch: "主机与网关配置不符",
-      endpoint_port_mismatch: "端口与网关配置不符",
-      endpoint_path_mismatch: "路径与网关配置不符",
+      endpoint_host_mismatch: "主机与本地服务配置不符",
+      endpoint_port_mismatch: "端口与本地服务配置不符",
+      endpoint_path_mismatch: "路径与本地服务配置不符",
       selection_changed: "当前供应商或模型已改变",
       managed_config_changed: "托管配置已改变"
     };

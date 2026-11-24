@@ -1,8 +1,7 @@
 import { flowProviderSlot } from "./flow-provider-colors";
 import "./flow-provider-colors.css";
 /** 网关总览：今日数字一排；任意 Agent → Codex++ → 任意供应商的三列拓扑；最近请求列表。 */
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArrowUpRight, ChevronDown, Plus } from "lucide-react";
 import { t, tf } from "./i18n";
 import {
@@ -17,13 +16,13 @@ import {
   type UsageSummary,
 } from "./gateway-model";
 import { hubAgents, hubLinks, hubPoolState, hubProviders, hubTotals, routeRecordsByEntry, successRate, type CodexSummary, type HubLink } from "./hub-overview-model";
-import { AGENT_ICONS, APP_LOGO_URL, Avatar, KeyCount, MemberStatusLabel, agentIconIsColor, makeRun, type Notify, type Run } from "./gateway-ui";
-import { publishGatewayPayload, useGatewayPayload } from "./gateway-store";
+import { APP_LOGO_URL, Avatar, GatewayLoadError, KeyCount, MemberStatusLabel, makeRun, type Notify, type Run } from "./gateway-ui";
+import { gatewayJump, publishGatewayPayload, useGatewayPayload, useGatewayState } from "./gateway-store";
+// 今日用量与 Agent 图标在 hub-shared.tsx：常驻的页面也要用，不必为它们加载整个网关总览。
+import { AgentGlyph, useTodayUsage } from "./hub-shared";
 import { AgentConnectDialog } from "./GatewayAgents";
 import { busyLinks, liveFlowRoutes, flowRoutePosition, flowAgent, pulseHops, type FlowEntry, type LiveFlowRoute } from "./request-flow-model";
 import { FlowRequestRow, useRequestFlow } from "./RequestFlow";
-import { agentVisible, singleAgent } from "./agent-focus-model";
-import { useAgentFocus } from "./agent-focus-store";
 import { ProviderAdder } from "./GatewayProviders";
 import "./HubOverview.css";
 import { CxCard, CxEmpty, CxSection, CxStats } from "./cx-layout";
@@ -33,40 +32,9 @@ const LIVE_REFRESH_MS = 3000;
 const FLOW_REFRESH_MS = 1500;
 /** 「最近请求」列出的条数；更多的去请求日志看。 */
 const FEED_LIMIT = 10;
-const USAGE_REFRESH_MS = 30_000;
 
 /** 侧栏状态卡、总览、网关页共用的网关数据在 gateway-store 里；这里转出 hook，保持原来的引用路径。 */
 export { useGatewayPayload };
-
-/** 今日用量（总览统计、首页网关一行共用），定时刷新。 */
-export function useTodayUsage(): UsageSummary | null {
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      invoke<{ status: string } & Partial<UsageSummary>>("load_gateway_usage", { range: "today" })
-        .then((result) => {
-          if (!cancelled && result.status === "ok" && result.totals) setSummary(result as UsageSummary);
-        })
-        .catch(() => undefined);
-    void load();
-    const timer = window.setInterval(load, USAGE_REFRESH_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-  return summary;
-}
-
-/** 单色品牌图标用 mask 着色，深浅主题下都跟随文字颜色。 */
-export function AgentGlyph({ agent, className = "" }: { agent: string; className?: string }) {
-  const url = AGENT_ICONS[agent];
-  if (url && agentIconIsColor(agent)) return <img alt="" className={`hub-agent-glyph hub-agent-glyph-plain ${className}`} data-agent-icon={agent} src={url} />;
-  // 没有打包图标的通用 Agent：名字首字母，不画空的遮罩方块。
-  if (!url) return <i aria-hidden="true" className={`hub-agent-glyph hub-agent-glyph-plain gw-agent-letter ${className}`}>{(agentName(agent).trim()[0] ?? "?").toUpperCase()}</i>;
-  return <i aria-hidden="true" className={`hub-agent-glyph ${className}`} style={url ? ({ "--hub-icon": `url("${url}")` } as CSSProperties) : undefined} />;
-}
 
 export function HubOverview({
   codex,
@@ -80,22 +48,19 @@ export function HubOverview({
   /** 跳到网关的某个页签或其它页面。 */
   onNavigate: (target: "gateway" | "gatewayProviders" | "gatewayUsage" | "requestLog") => void;
 }) {
-  const payload = useGatewayPayload(LIVE_REFRESH_MS);
+  const { payload, error } = useGatewayState(LIVE_REFRESH_MS);
   const usage = useTodayUsage();
   const callsByProvider = useMemo(
     () => (usage ? new Map(usage.byProvider.map((group) => [group.key, group.calls])) : null),
     [usage],
   );
-  // 没勾选的 Agent 不在总览里出现；单 Agent 模式下网关就是这一个 Agent 专用的供应商池。
-  const focus = useAgentFocus();
-  const solo = singleAgent(focus);
-  const agents = hubAgents(payload, codex).filter((agent) => agentVisible(focus, agent.id));
+  const agents = hubAgents(payload, codex);
   const providers = hubProviders(payload, callsByProvider);
   // 连线的「活跃」改由真实请求决定：有请求在进行的连线流动，每条请求一颗来回的光点。
   const links = hubLinks(agents, providers).map((link) => (link.tone === "live" ? { ...link, tone: "idle" as const } : link));
   const totals = hubTotals(payload);
   const requestFlow = useRequestFlow(FLOW_REFRESH_MS);
-  const flowEntries = requestFlow.entries.filter((entry) => agentVisible(focus, flowAgent(entry)));
+  const flowEntries = requestFlow.entries;
   const flow = useMemo(
     () => ({ busy: busyLinks(flowEntries), routes: liveFlowRoutes(flowEntries) }),
     // 连线随进行中的请求、路由和响应阶段变化。
@@ -111,6 +76,20 @@ export function HubOverview({
   const [busy, setBusy] = useState<string | null>(null);
   const run: Run = makeRun(setBusy, publishGatewayPayload, notify);
   const poolState = hubPoolState(payload);
+  // 点拓扑里的某个 Agent：留在网关里，到「Agent 接入」并展开它那一行；不在网关列表里的才去它自己的页面。
+  const openAgent = (id: string) => {
+    if (!payload?.agents.some((agent) => agent.agent === id)) {
+      onOpenAgent(id);
+      return;
+    }
+    gatewayJump.agent = id;
+    onNavigate("gateway");
+  };
+  // 点拓扑里的某家供应商：到共享供应商并展开、滚到那一家。
+  const openProvider = (id: string) => {
+    gatewayJump.provider = id;
+    onNavigate("gatewayProviders");
+  };
 
   // 参照 Cursor 的 Customize：顶部一排今日数字，中间一张拓扑卡（Codex++ 的卖点：任意 Agent → 网关 → 多家供应商），
   // 下面「最近请求」一个列表。现状说明不再单独写一段，拓扑图自己就说明了。
@@ -120,22 +99,23 @@ export function HubOverview({
         aside={<button className="hub-link" onClick={() => onNavigate("gatewayUsage")} type="button">{t("用量明细")}<ArrowUpRight className="h-3.5 w-3.5" /></button>}
         title={t("今日")}
       >
-        <UsageStats showAgents={!solo} usage={usage} />
+        <UsageStats showAgents usage={usage} />
       </CxSection>
+
+      {/* 网关状态一次都没读到：说明原因、给重试，不再一直「读取中…」。 */}
+      {!payload && error ? <GatewayLoadError error={error} /> : null}
 
       <CxCard className="hub-topology-card">
         <HubTopology className="hub-topology-compact" flow={flow} links={links}>
           <div className="hub-col">
             <div className="hub-col-head"><span>{t("Agent")}</span><span>{t("请求")}</span></div>
             {agents.map((agent) => (
-              <AgentNode agent={agent} key={agent.id} onOpen={() => onOpenAgent(agent.id)} />
+              <AgentNode agent={agent} key={agent.id} onOpen={() => openAgent(agent.id)} />
             ))}
-            {solo ? null : (
-              <button className="hub-node hub-node-ghost" onClick={() => setAdding("agent")} type="button">
-                <Plus aria-hidden="true" className="h-4 w-4" />
-                {t("接入 Agent")}
-              </button>
-            )}
+            <button className="hub-node hub-node-ghost" onClick={() => setAdding("agent")} type="button">
+              <Plus aria-hidden="true" className="h-4 w-4" />
+              {t("接入 Agent")}
+            </button>
           </div>
 
           <div className="hub-core" data-node="hub" data-running={payload?.helperRunning ?? false}>
@@ -145,7 +125,7 @@ export function HubOverview({
                 <strong>Codex++</strong>
                 <span className="hub-addr">
                   <i className="hub-dot" data-tone={payload?.helperRunning ? "ok" : "off"} />
-                  {payload ? `127.0.0.1:${payload.port}` : t("读取中…")}
+                  {payload ? `127.0.0.1:${payload.port}` : error ? t("读取失败") : t("读取中…")}
                 </span>
               </span>
             </div>
@@ -153,10 +133,8 @@ export function HubOverview({
             <p
               className="hub-caps"
               title={!payload
-                ? t("正在读取网关状态…")
-                : solo
-                  ? tf("{0} 通过 Codex++ 使用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [agentName(solo), providers.length])
-                  : tf("{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [connected, providers.length])}
+                ? t("正在读取本地服务状态…")
+                : tf("{0} 个 Agent 通过 Codex++ 共用 {1} 个供应商。请求按模型名路由，Key 冷却或供应商熔断时自动换上游。", [connected, providers.length])}
             >
               {[
                 t("按模型名路由"),
@@ -174,9 +152,9 @@ export function HubOverview({
           </div>
 
           <div className="hub-col">
-            <div className="hub-col-head"><span>{t("供应商池")}</span><span>{t("今日调用")}</span></div>
-            {poolState === "loading" ? <p className="hub-empty">{t("读取中…")}</p> : null}
-            {poolState === "empty" ? <p className="hub-empty">{t("供应商池还是空的。")}</p> : null}
+            <div className="hub-col-head"><span>{t("共享供应商")}</span><span>{t("今日调用")}</span></div>
+            {poolState === "loading" ? <p className="hub-empty">{error ? t("读取失败") : t("读取中…")}</p> : null}
+            {poolState === "empty" ? <p className="hub-empty">{t("共享供应商还是空的。")}</p> : null}
             {poolState === "allOff" ? <p className="hub-empty">{tf("池里的 {0} 个供应商都已关闭。", [payload?.pool.length ?? 0])}</p> : null}
             {poolState === "empty" && pendingImports ? (
               <button className="hub-node hub-node-ghost hub-node-import" onClick={() => setAdding("import")} type="button">
@@ -184,7 +162,7 @@ export function HubOverview({
               </button>
             ) : null}
             {providers.map((provider) => (
-              <button className="hub-node" data-node={`provider:${provider.id}`} data-flow-provider={flowProviderSlot(provider.id)} key={provider.id} onClick={() => onNavigate("gatewayProviders")} title={provider.name} type="button">
+              <button className="hub-node" data-node={`provider:${provider.id}`} data-flow-provider={flowProviderSlot(provider.id)} key={provider.id} onClick={() => openProvider(provider.id)} title={provider.name} type="button">
                 <i className="flow-provider-mark" aria-hidden="true" />
                 <Avatar baseUrl={provider.baseUrl} name={provider.name} size="sm" />
                 <span className="hub-node-text">
@@ -215,7 +193,7 @@ export function HubOverview({
           {!requestFlow.loaded ? (
             <CxEmpty title={t("读取中…")} />
           ) : feed.length === 0 ? (
-            <CxEmpty title={t("还没有请求经过网关")} detail={t("在已接入的 Agent 里发一条消息试试。")} />
+            <CxEmpty title={t("还没有请求经过本地服务")} detail={t("在已接入的 Agent 里发一条消息试试。")} />
           ) : (
             <ul className="hub-flow-list">{feed.map((entry) => <FeedRow entry={entry} key={entry.id} payload={payload} record={routeRecords.get(entry.id) ?? null} />)}</ul>
           )}
@@ -243,7 +221,7 @@ export function HubOverview({
 function AgentNode({ agent, onOpen }: { agent: ReturnType<typeof hubAgents>[number]; onOpen: () => void }) {
   const detail = agent.direct
     ? (agent.detail ? tf("直连 · {0}", [agent.detail]) : t("直连模式"))
-    : !agent.enabled ? t("未接入网关")
+    : !agent.enabled ? t("未接入本地服务")
       : agent.manualModels !== undefined ? tf("手动接入 · {0} 个模型", [agent.manualModels])
         : agent.detail || t("已接入");
   return (
@@ -288,7 +266,7 @@ function UsageStats({ usage, showAgents }: { usage: UsageSummary | null; showAge
   const rate = totals ? successRate(totals) : null;
   const cache = totals ? cacheHitRate(totals) : null;
   const cost = (usage?.costs ?? []).filter((item) => item.amount > 0).map((item) => formatMoney(item.amount, item.currency)).join(" + ");
-  const empty = !usage ? t("读取中…") : totals?.calls === 0 ? t("今天还没有经过网关的请求。") : null;
+  const empty = !usage ? t("读取中…") : totals?.calls === 0 ? t("今天还没有经过本地服务的请求。") : null;
   return (
     <CxStats
       items={[
@@ -301,10 +279,9 @@ function UsageStats({ usage, showAgents }: { usage: UsageSummary | null; showAge
   );
 }
 
-/** 今日调用按 Agent 拆分，一行文字（「Codex 56% · Claude Code 44%」）；单 Agent 模式下没有意义，不画。 */
+/** 今日调用按 Agent 拆分，一行文字（「Codex 56% · Claude Code 44%」）。 */
 function AgentSplit({ usage }: { usage: UsageSummary }) {
-  const focus = useAgentFocus();
-  const groups = usage.byAgent.filter((group) => agentVisible(focus, group.key));
+  const groups = usage.byAgent;
   const agentTotal = groups.reduce((sum, group) => sum + group.calls, 0) || 1;
   if (!groups.length) return null;
   return (

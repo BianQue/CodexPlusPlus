@@ -1,6 +1,6 @@
 //! 网关的路由：Agent 绑定 → 模型名 → 候选上游（供应商 × Key）列表。
 //!
-//! 只看网关自己的供应商池和模型组（`gateway.json`），与直连模式的供应商无关。模型名有三种写法：
+//! 只看网关自己的共享供应商和模型组（`gateway.json`），与直连模式的供应商无关。模型名有三种写法：
 //! - 裸模型名：池里所有提供它的供应商按池顺序依次尝试；
 //! - `<供应商 id>/<模型>`：只发给这个供应商；
 //! - `group/<组 id>`：按模型组的成员与模式展开，成员也可以是另一个组，或带 `*` 的通配符。
@@ -41,7 +41,7 @@ pub struct GatewayCandidate {
     pub relay: RelayProfile,
     pub key: KeyRef,
     pub upstream_model: String,
-    /// 这家这个模型的上下文窗口（供应商池里写了才有）：请求比它还长时排到最后再试。
+    /// 这家这个模型的上下文窗口（共享供应商里写了才有）：请求比它还长时排到最后再试。
     pub window: Option<u64>,
     /// 这家每个 Key 的主动限速上限（没填就是不限）；候选循环发请求前按它占名额。
     pub limits: KeyLimits,
@@ -281,7 +281,8 @@ pub(crate) fn group_listed_for_binding(gateway: &GatewaySettings, binding: &Agen
 }
 
 /// Codex 的模型列表：每家供应商的模型都列在它自己名下，Codex 选择器里按供应商分组时每组都完整。
-/// - 只有一家提供的模型：通常用裸模型名；固定到该供应商的默认模型沿用带前缀的名称；
+/// - 只有一家提供的模型：通常用裸模型名；固定到该供应商的默认模型沿用带前缀的名称
+///   （Codex 模型目录里另有一份隐藏的裸名，见 [`codex_pinned_default_alias`]）；
 /// - 多家都提供的模型：每家各列一份 `<供应商 id>/<模型>`（固定发给那一家）；打开「多家自动切换」
 ///   （`auto_models`）时再单独列一份裸模型名：按池顺序依次尝试各家，出错换下一家；
 /// - 最后是有成员的模型组。
@@ -355,6 +356,29 @@ pub fn codex_binding_models(gateway: &GatewaySettings, binding: &AgentBinding) -
         (index != default_block, index)
     });
     models
+}
+
+/// 默认模型固定成 `<供应商 id>/<模型>`、这个模型又只有那一家提供时，列表里用带前缀的名称顶替了裸名
+/// （见 [`codex_pool_blocks`]）。裸名照样路由到那一家，可 Codex 的 spawn_agent 只认目录里有的名字，
+/// 指定裸名会报 Unknown model（#3179）：返回这个裸名，Codex 模型目录里另列一份隐藏条目
+/// （不进选择器、不重复显示，也不进 `/v1/models`）。
+/// 绑定里自己声明过这个裸名时它本来就公开列着，不算别名。
+pub fn codex_pinned_default_alias(gateway: &GatewaySettings, binding: &AgentBinding) -> Option<String> {
+    let relays = binding_pool_relays(gateway, binding);
+    let (relay, upstream) = qualified_in(&relays, &binding_default_model(gateway, binding))?;
+    let model = chat_models(relay)
+        .into_iter()
+        .find(|model| model.eq_ignore_ascii_case(&upstream))?;
+    (serving_count(&relays, &model) == 1
+        && !binding
+            .declared_models()
+            .iter()
+            .any(|declared| declared.eq_ignore_ascii_case(&model))
+        && !is_disabled_group_model(gateway, &model)
+        && !unlisted_members(gateway).contains(&model.to_ascii_lowercase())
+        && !unavailable_registered_model(gateway, binding, &model)
+        && model_is_routable(gateway, binding, &model))
+    .then_some(model)
 }
 
 /// Codex 模型列表按分组切成的几块：每家一块、多家自动切换一块、模型组一块（空块不要）。
@@ -985,6 +1009,15 @@ fn effective_model_detailed(
     {
         return (requested_slug, false);
     }
+    // `<供应商 id>/<模型>` 的供应商不在这个 Agent 的池里（删了 / 关了 / 被排除）时，不按「未知模型」
+    // 改写成默认模型（#3179：`<直连供应商>/gpt-6.1-sol` 被静默换成默认的 gpt-6-astra）。
+    // 池里有别家提供同名模型的，原样交给 expand_model 去掉前缀路由（#2897）；前缀是网关里
+    // 还在的供应商、池里又没人提供同名模型的，原样留着，由 resolve_plan 明确报错。
+    if unpooled_qualified_bare(gateway, binding, &requested_slug).is_some()
+        || unpooled_provider_prefix(gateway, binding, &requested_slug).is_some()
+    {
+        return (requested_slug, false);
+    }
     match binding.unknown_model {
         UnknownModelPolicy::MapToDefault if !default_model.is_empty() => {
             let mapped = !default_model.eq_ignore_ascii_case(&requested_slug);
@@ -1090,6 +1123,52 @@ fn qualified_in<'a>(
         .copied()
         .find(|relay| relay.id.eq_ignore_ascii_case(prefix))
         .map(|relay| (relay, rest.trim().to_string()))
+}
+
+/// `<前缀>/<模型>` 形式、前缀不是池内供应商、整串也没人当模型名声明时，拆出 (前缀, 模型)。
+fn unpooled_qualified<'m>(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &'m str,
+) -> Option<(&'m str, &'m str)> {
+    if model.starts_with(GROUP_MODEL_PREFIX) || is_pattern(model) {
+        return None;
+    }
+    let (prefix, rest) = model.split_once('/')?;
+    let rest = rest.trim();
+    if rest.is_empty()
+        || qualified_provider(gateway, binding, model).is_some()
+        || declared_by_any(&binding_pool_relays(gateway, binding), model)
+    {
+        return None;
+    }
+    Some((prefix, rest))
+}
+
+/// 池外供应商的限定名，池里有别家提供去掉前缀的同名模型时，返回那个模型名（expand_model 的 #2897 规则）。
+fn unpooled_qualified_bare<'m>(
+    gateway: &GatewaySettings,
+    binding: &AgentBinding,
+    model: &'m str,
+) -> Option<&'m str> {
+    let (_, rest) = unpooled_qualified(gateway, binding, model)?;
+    binding_pool_relays(gateway, binding)
+        .iter()
+        .any(|relay| serves(relay, rest))
+        .then_some(rest)
+}
+
+/// 限定名的前缀是网关里还在、但这个 Agent 用不了（关了 / 被排除）的供应商时返回它。
+fn unpooled_provider_prefix<'a>(
+    gateway: &'a GatewaySettings,
+    binding: &AgentBinding,
+    model: &str,
+) -> Option<&'a GatewayProvider> {
+    let (prefix, _) = unpooled_qualified(gateway, binding, model)?;
+    gateway
+        .providers
+        .iter()
+        .find(|provider| provider.relay.id.eq_ignore_ascii_case(prefix))
 }
 
 /// 列表里有没有供应商把这个完整名字当模型名声明。
@@ -1665,9 +1744,9 @@ fn resolve_plan_with(
 ) -> anyhow::Result<RoutePlan> {
     let binding = gateway
         .active_binding(agent)
-        .with_context(|| format!("Codex++ 网关模式没有为 {} 开启", agent.as_str()))?;
+        .with_context(|| format!("Codex++ 本地服务模式没有为 {} 开启", agent.as_str()))?;
     if binding_pool_relays(gateway, binding).is_empty() {
-        bail!("网关的供应商池是空的或都已关闭：请在网关的「供应商」里添加或打开供应商");
+        bail!("共享供应商是空的或都已关闭：请在本地服务的「供应商」里添加或打开供应商");
     }
     let default_model = binding_default_model(gateway, binding);
     let (model, mapped_to_default) =
@@ -1702,7 +1781,7 @@ fn resolve_plan_with(
             if relays.is_empty() {
                 // 不退回组里其它成员：它们多半不收图，转过去只会报错或把图片丢掉。
                 bail!(
-                    "模型组「{}」的图像输入模型 {} 不可用（池里没有打开的供应商提供它）：请求里带图片，没有改发给组里其它成员。请在网关「路由」里改选图像输入模型",
+                    "模型组「{}」的图像输入模型 {} 不可用（池里没有打开的供应商提供它）：请求里带图片，没有改发给组里其它成员。请在本地服务「路由」里改选图像输入模型",
                     group.name,
                     group.image_input_model.trim()
                 );
@@ -1728,6 +1807,23 @@ fn resolve_plan_with(
     {
         prefer_remembered(&mut relays, &remembered);
     }
+    if relays.is_empty()
+        && group_id.is_none()
+        && let Some(provider) = unpooled_provider_prefix(gateway, binding, &model)
+    {
+        // 显式指定了某家供应商的模型：那家用不了、池里也没人提供同名模型时明确报错，
+        // 不改发到默认模型，也不把带前缀的名字原样发给别家（#3179）。
+        let reason = if !provider.enabled {
+            "已关闭".to_string()
+        } else {
+            format!("不在 {} 的共享供应商里", agent.as_str())
+        };
+        let rest = model.split_once('/').map(|(_, rest)| rest.trim()).unwrap_or_default();
+        bail!(
+            "模型 {model} 指定的供应商「{}」{reason}，池里也没有其它供应商提供 {rest}；为避免换成别的模型，这次请求没有发出。请在本地服务里打开该供应商或把它加回共享供应商，或改选其它模型",
+            provider.relay.name
+        );
+    }
     if relays.is_empty() && group_id.is_none() {
         // 原样转发的未知模型：交给默认模型所在的供应商。
         relays = match selected_provider(gateway, binding, &default_model)? {
@@ -1746,7 +1842,7 @@ fn resolve_plan_with(
         .collect();
     }
     if relays.is_empty() {
-        bail!("网关的供应商池里没有供应商提供模型 {model}");
+        bail!("共享供应商里没有供应商提供模型 {model}");
     }
     let mut gate = crate::gateway::quota::DispatchGate::default();
     let mut permitted = Vec::new();
@@ -1786,7 +1882,7 @@ fn resolve_plan_with(
                 "model": model,
                 "provider": permitted.first().map(|(relay, _)| relay.name.as_str()).unwrap_or_default(),
                 "providerId": permitted.first().map(|(relay, _)| relay.id.as_str()).unwrap_or_default(),
-                "hint": "请求的模型不在网关供应商池里（或所在供应商已关闭），已按「未知模型」策略改发到默认模型；可在网关的 Agent 接入设置里改成原样转发",
+                "hint": "请求的模型不在共享供应商里（或所在供应商已关闭），已按「未知模型」策略改发到默认模型；可在本地服务的 Agent 接入设置里改成原样转发",
             }),
         );
     }
@@ -1810,8 +1906,10 @@ fn resolve_plan_with(
             .filter(|_| !rate_limit_off)
             .map(GatewayProvider::key_limits)
             .unwrap_or_default();
+        // 带上上游模型：只因别的模型被限流而冷却的 Key 照常可用（#3229）。
         let order = key_pool::order_keys_detailed(
             &relay,
+            &upstream_model,
             gateway.key_policy.mode,
             conversation.as_deref(),
             now,
@@ -2527,8 +2625,11 @@ mod tests {
             routed(&gateway, "kimi/kimi-k3-preview"),
             vec![pair("kimi", "kimi-k3-preview")]
         );
-        // 关掉的供应商不能用前缀绕过。
-        assert_eq!(routed(&gateway, "off/off-model")[0].1, "deepseek-v4-pro");
+        // 关掉的供应商不能用前缀绕过；也不静默换成默认模型，明确报错（#3179）。
+        let error = resolve_plan(&gateway, &ToolId::Claude, "off/off-model", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("已关闭"), "{error}");
     }
 
     #[test]
@@ -2774,6 +2875,85 @@ mod tests {
                 .iter()
                 .all(|(_, model)| !model.starts_with("gone/")),
             "前缀不能原样发给上游"
+        );
+    }
+
+    /// #3179：`<池外供应商>/<模型>` 不能按「未知模型」静默换成默认模型。
+    #[test]
+    fn qualified_model_of_an_unpooled_provider_is_never_swapped_for_the_default() {
+        let codex_gateway = |policy: UnknownModelPolicy| {
+            let mut gateway = GatewaySettings {
+                providers: vec![
+                    provider("pool-astra", "gpt-6-astra\ngpt-6.1-terra"),
+                    provider("direct-cpa", "gpt-6.1-sol"),
+                ],
+                ..GatewaySettings::default()
+            };
+            gateway.bindings.insert(
+                "codex".to_string(),
+                AgentBinding {
+                    enabled: true,
+                    model: "gpt-6-astra".to_string(),
+                    unknown_model: policy,
+                    ..AgentBinding::default()
+                },
+            );
+            gateway
+        };
+        let routed_codex = |gateway: &GatewaySettings, model: &str| {
+            resolve_plan(gateway, &ToolId::Codex, model, None).map(|plan| {
+                plan.candidates
+                    .into_iter()
+                    .map(|candidate| (candidate.relay.id, candidate.upstream_model))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // 供应商在池里：照常发给它。
+        let gateway = codex_gateway(UnknownModelPolicy::MapToDefault);
+        assert_eq!(
+            routed_codex(&gateway, "direct-cpa/gpt-6.1-sol").unwrap(),
+            vec![pair("direct-cpa", "gpt-6.1-sol")]
+        );
+
+        for policy in [UnknownModelPolicy::MapToDefault, UnknownModelPolicy::Passthrough] {
+            // 被排除出 Codex 的池：池里没人提供 gpt-6.1-sol → 明确报错，不改发到 gpt-6-astra。
+            let mut gateway = codex_gateway(policy);
+            gateway
+                .bindings
+                .get_mut("codex")
+                .unwrap()
+                .pool_exclude
+                .push("direct-cpa".to_string());
+            let binding = gateway.active_binding(&ToolId::Codex).unwrap();
+            assert_eq!(
+                effective_model_detailed(&gateway, binding, "gpt-6-astra", "direct-cpa/gpt-6.1-sol"),
+                ("direct-cpa/gpt-6.1-sol".to_string(), false),
+                "{policy:?}"
+            );
+            let error = routed_codex(&gateway, "direct-cpa/gpt-6.1-sol").unwrap_err().to_string();
+            assert!(error.contains("direct-cpa") && error.contains("不在 codex 的共享供应商里"), "{error}");
+
+            // 关掉的供应商同理。
+            let mut gateway = codex_gateway(policy);
+            gateway.providers[1].enabled = false;
+            let error = routed_codex(&gateway, "direct-cpa/gpt-6.1-sol").unwrap_err().to_string();
+            assert!(error.contains("已关闭"), "{error}");
+
+            // 池里有别家提供同名模型：去掉前缀交给它，仍是 gpt-6.1-sol。
+            gateway.providers.push(provider("official", "gpt-6.1-sol"));
+            assert_eq!(
+                routed_codex(&gateway, "direct-cpa/gpt-6.1-sol").unwrap(),
+                vec![pair("official", "gpt-6.1-sol")],
+                "{policy:?}"
+            );
+        }
+
+        // 真正的未知模型仍按策略改写成默认模型（#2874 不受影响）。
+        let gateway = codex_gateway(UnknownModelPolicy::MapToDefault);
+        assert_eq!(
+            routed_codex(&gateway, "gpt-unknown").unwrap(),
+            vec![pair("pool-astra", "gpt-6-astra")]
         );
     }
 
@@ -3316,6 +3496,45 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn codex_pinned_single_provider_default_keeps_a_hidden_bare_alias() {
+        // #3179：默认模型固定成「从某家下选」的 `kimi/kimi-k3`，kimi-k3 只有 kimi 一家提供。
+        let gateway = gateway("kimi/kimi-k3");
+        let mut binding = gateway.binding(&ToolId::Claude).unwrap().clone();
+        // 选择器那份列表照旧只有带前缀的名称，不重复显示。
+        let pool = codex_pool_models(&gateway, &binding);
+        assert!(pool.iter().any(|model| model == "kimi/kimi-k3"));
+        assert!(!pool.iter().any(|model| model == "kimi-k3"));
+        // /v1/models 也不变。
+        assert!(!codex_binding_models(&gateway, &binding).iter().any(|model| model == "kimi-k3"));
+        // Codex 目录里另有裸名，spawn_agent 指定 kimi-k3 才认得；路由不变，仍发给 kimi。
+        assert_eq!(codex_pinned_default_alias(&gateway, &binding).as_deref(), Some("kimi-k3"));
+        let catalog = crate::gateway::apply::codex_gateway_model_catalog(&gateway, &binding);
+        let listed: Vec<String> = catalog
+            .model_list
+            .lines()
+            .map(|line| crate::model_suffix::parse_model_suffix(line).0)
+            .collect();
+        assert_eq!(listed[0], "kimi/kimi-k3");
+        assert_eq!(listed.iter().filter(|model| *model == "kimi-k3").count(), 1);
+        assert!(model_is_routable(&gateway, &binding, "kimi-k3"));
+        assert_eq!(routed(&gateway, "kimi-k3"), vec![pair("kimi", "kimi-k3")]);
+        // 目录里裸名那份隐藏，带前缀的那份照常显示。
+        let metadata: serde_json::Value = serde_json::from_str(&catalog.model_metadata).unwrap();
+        assert_eq!(metadata["kimi-k3"]["visibility"], "hide");
+        assert_eq!(metadata["kimi-k3"]["codex_plus_group_id"], "kimi");
+        assert!(metadata["kimi/kimi-k3"].get("visibility").is_none());
+
+        // 多家都有的模型、或默认模型本来就是裸名时没有别名。
+        binding.model = "ds/deepseek-v4-pro".into();
+        assert_eq!(codex_pinned_default_alias(&gateway, &binding), None);
+        binding.model = "kimi-k3".into();
+        assert_eq!(codex_pinned_default_alias(&gateway, &binding), None);
+        let catalog = crate::gateway::apply::codex_gateway_model_catalog(&gateway, &binding);
+        let metadata: serde_json::Value = serde_json::from_str(&catalog.model_metadata).unwrap();
+        assert!(metadata["kimi-k3"].get("visibility").is_none());
     }
 
     #[test]

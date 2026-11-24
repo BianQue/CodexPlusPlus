@@ -1,6 +1,6 @@
 //! 网关模式的持久状态：`<状态目录>/gateway.json`。
 //!
-//! 网关模式与原来的直连模式完全独立：供应商池、路由组都只存在这里，
+//! 网关模式与原来的直连模式完全独立：共享供应商、路由组都只存在这里，
 //! 不读也不写 `settings.json` 里 Codex / Claude / Grok 各自的供应商。从直连模式「导入」是复制一份，
 //! 之后两边互不影响。文件里有上游 Key 和本地 token，新建时只给本人读写。
 
@@ -98,7 +98,7 @@ impl SubscriptionPolicy {
     }
 }
 
-/// 网关供应商池里的一个供应商。上游配置复用 [`RelayProfile`] 的结构（协议、地址、多 Key 等），
+/// 网关共享供应商里的一个供应商。上游配置复用 [`RelayProfile`] 的结构（协议、地址、多 Key 等），
 /// 但只存在网关里；`relay.id` 同时是它的短名，`<id>/<模型>` 可以指定只发给它。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -693,7 +693,7 @@ pub struct GatewaySettings {
     /// 退出或安装更新前已经把开着的 Agent 恢复成直连（绑定仍是开启）：下次启动要重新接回网关。
     #[serde(default, skip_serializing_if = "is_false")]
     pub restored_at_exit: bool,
-    /// 网关的供应商池（顺序即同一模型多家时的尝试顺序）。
+    /// 网关的共享供应商（顺序即同一模型多家时的尝试顺序）。
     #[serde(default)]
     pub providers: Vec<GatewayProvider>,
     /// 网关的路由组。
@@ -719,7 +719,13 @@ pub struct GatewaySettings {
     /// 开着时供应商页提示可以导入。默认关（opt-in）：关着时不读这些登录文件。
     #[serde(default)]
     pub local_login_discovery: bool,
-    /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着供应商池自动变化。
+    /// Codex 与 Codex++（直连本地代理和网关）之间用 Responses WebSocket（2.7.0 起支持）。
+    /// 默认关（opt-in）：握手阶段回 426，Codex 改走 HTTP/SSE，与 2.6 一致。WS 续接依赖上游保留
+    /// 连接内状态：第三方中转接受了升级却不保留状态时续接请求会丢推理和上下文（#3175），
+    /// 闲置后上游断开也会让续接失败（#3169）。需要更低延迟、上游确实支持时在网关选项里打开。
+    #[serde(default)]
+    pub responses_websocket: bool,
+    /// 自动组上改过的设置（键是小写模型名）。没改过的自动组不落盘，跟着共享供应商自动变化。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub auto_groups: BTreeMap<String, AutoGroupSettings>,
     /// 收藏的模型（管理器模型下拉里点的星标）：写给 Codex 的模型目录时标出来，Codex 的选择器里也显示星标。
@@ -770,6 +776,7 @@ impl Default for GatewaySettings {
             auto_models: true,
             model_suffix: true,
             local_login_discovery: false,
+            responses_websocket: false,
             auto_groups: BTreeMap::new(),
             favorite_models: Vec::new(),
             image_models: BTreeMap::new(),
@@ -1153,6 +1160,8 @@ fn read_store(path: &Path) -> anyhow::Result<GatewaySettings> {
         if crate::relay_config::normalize_relay_profile_for_storage(&mut normalized).is_ok() {
             provider.relay = normalized;
         }
+        crate::gateway::opencode::normalize_deepseek_reasoning_metadata(&mut provider.relay);
+        crate::gateway::opencode::normalize_hy4_reasoning_metadata(&mut provider.relay);
         // 导入或手写 `[1M]` 带进上游配置的窗口，收进网关自己的按模型窗口。
         provider.adopt_relay_windows();
         // 发请求时只认网关自己的代理设置，不按 id 去查直连模式的代理表。

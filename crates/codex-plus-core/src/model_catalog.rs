@@ -1401,7 +1401,7 @@ async fn fetch_official_login_model_ids(
     let endpoint = format!("{}/models", base.trim().trim_end_matches('/'));
     let version = crate::gateway::chatgpt_backend::codex_version(
         &crate::codex_home::default_codex_home_dir(),
-    );
+    ).await;
     let client = crate::http_client::proxied_client_for_relay(&profile.user_agent, &profile)?;
     let mut request = client
         .get(&endpoint)

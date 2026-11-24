@@ -363,7 +363,23 @@
   function modelReasoningEfforts(modelName) {
     const supported = codexPlusModelMetadata(modelName)?.supportedReasoningEfforts;
     if (Array.isArray(supported) && supported.length > 0) {
-      const efforts = supported.map((entry) => ({ ...entry }));
+      // 目录声明存在三种形态：字符串数组（provider 配置）、Codex 原生 {effort} 对象
+      // 与前端 {reasoningEffort} 对象。归一化后再消费，避免 {...entry} 把字符串展开
+      // 成空对象、或 {effort} 条目因缺少 reasoningEffort 字段被界面过滤掉（#3210）。
+      const efforts = supported.flatMap((entry) => {
+        if (typeof entry === "string") return entry ? [{ reasoningEffort: entry }] : [];
+        if (!entry || typeof entry !== "object") return [];
+        const effort = typeof entry.reasoningEffort === "string" && entry.reasoningEffort
+          ? entry.reasoningEffort
+          : typeof entry.effort === "string" && entry.effort ? entry.effort : "";
+        if (!effort) return [];
+        const next = { ...entry, reasoningEffort: effort };
+        delete next.effort;
+        return [next];
+      });
+      if (!efforts.length) {
+        return ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({ reasoningEffort, description: `${reasoningEffort} effort` }));
+      }
       const hasMax = efforts.some((e) => e.reasoningEffort === "max");
       const hasUltra = efforts.some((e) => e.reasoningEffort === "ultra");
       if (!hasMax) efforts.push({ reasoningEffort: "max", description: "Maximum reasoning depth for the hardest problems" });
@@ -386,6 +402,12 @@
       const valid = typeof metadata[key] === "string" ? !!metadata[key] : Number.isFinite(metadata[key]) && metadata[key] > 0;
       if (valid && descriptor[key] !== metadata[key]) {
         descriptor[key] = metadata[key];
+        changed = true;
+      }
+    }
+    for (const [key, value] of Object.entries(codexPlusModelServiceTiers(metadata, descriptor))) {
+      if (JSON.stringify(descriptor[key] ?? []) !== JSON.stringify(value)) {
+        descriptor[key] = value;
         changed = true;
       }
     }
@@ -425,11 +447,32 @@
       isDefault: false,
       defaultReasoningEffort: metadata?.defaultReasoningEffort || "medium",
       supportedReasoningEfforts: modelReasoningEfforts(modelName),
+      ...codexPlusModelServiceTiers(metadata),
       // 图片输入能力只带目录/元数据里声明过的；没声明不写，不替未知模型宣称收图，
       // 与此前的原生行为一致。
       ...(modalities ? { inputModalities: modalities } : {}),
       ...(original !== null ? { supportsImageDetailOriginal: original } : {}),
     };
+  }
+
+  function codexPlusModelServiceTiers(metadata, descriptor) {
+    if (!metadata) return {};
+    const denyFast = metadata.prioritySupportOverride === false;
+    const fields = {};
+    // New-chat model queries use these descriptors before a thread exists.
+    for (const [key, id] of [["serviceTiers", "priority"], ["additionalSpeedTiers", "fast"]]) {
+      const declared = metadata[key];
+      if (Array.isArray(declared) && declared.length) {
+        fields[key] = structuredClone(declared);
+      }
+      if (denyFast) {
+        const existing = fields[key] ?? descriptor?.[key];
+        if (Array.isArray(existing)) {
+          fields[key] = existing.filter((tier) => String(typeof tier === "string" ? tier : tier?.id || "").trim().toLowerCase() !== id);
+        }
+      }
+    }
+    return fields;
   }
 
   // 元数据里声明的输入模态（camelCase / snake_case 都认），没声明返回 null。

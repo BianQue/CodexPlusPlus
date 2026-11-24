@@ -35,6 +35,7 @@ fn provider(name: &str, models: &str) -> ProviderInput {
         strip_responses_image_detail: None,
         disable_tool_search: None,
         custom_headers: None,
+        strip_responses_output_encrypted_content: None,
     }
 }
 
