@@ -130,8 +130,9 @@
 
 ## 提交与合入
 
-- 默认直接提交并合入 `main`。
-- 仅在用户明确要求时创建 PR。
+- 本仓库是上游 `BigPizzaV3/CodexPlusPlus` 的 fork：本地 `main` 和 `fork/main` 只做 `origin/main` 的镜像，只快进，不在上面提交。
+- 功能在 `feat/*` 分支上做。同步上游时把 `origin/main` 合进功能分支，已推送的分支不要 rebase 或强推。
+- 仅在用户明确要求时创建 PR。提 PR 前从最新的 `origin/main` 切干净分支，只放功能提交，不带 merge 提交。
 - 提交信息、PR 描述里不加 `Co-Authored-By: Claude …` 等 AI 署名；本地 `.git/hooks/commit-msg` 也会自动删掉这一行。
 
 ## 发版
