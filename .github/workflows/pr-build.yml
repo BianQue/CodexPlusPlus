@@ -12,6 +12,10 @@ on:
       - "**/*.md"
   workflow_dispatch:
     inputs:
+      source_sha:
+        description: "要打包的完整 40 位提交号（小写）"
+        required: true
+        type: string
       rust_test_filter:
         description: "只跑名字匹配的 Rust 用例并串行执行（留空跑全量），排查平台相关失败时用"
         default: ""
@@ -29,10 +33,32 @@ concurrency:
 jobs:
   windows-artifacts:
     name: Windows artifacts
+    if: github.repository == 'BianQue/CodexPlusPlus' && github.ref == 'refs/heads/ci/windows-trae-release' && github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
     steps:
+      - name: Validate source commit input
+        shell: pwsh
+        run: |
+          if ($env:SOURCE_SHA -cnotmatch '^[0-9a-f]{40}$') {
+            throw "source_sha 必须是完整的 40 位小写提交号，收到：$env:SOURCE_SHA"
+          }
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+
+      - name: Verify source commit
+        shell: pwsh
+        run: |
+          $actual = git rev-parse --verify HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:SOURCE_SHA) {
+            throw "Expected source $env:SOURCE_SHA, got $actual"
+          }
+          Write-Host "Verified source commit: $actual"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -180,6 +206,18 @@ jobs:
             Pop-Location
           }
 
+      - name: Generate Windows EXE checksums
+        shell: pwsh
+        run: |
+          foreach ($directory in @('dist/windows/app', 'dist/windows')) {
+            $files = @(Get-ChildItem -LiteralPath $directory -File -Filter '*.exe' | Sort-Object Name)
+            if ($files.Count -ne 1) { throw "Expected one EXE in $directory, found $($files.Count)" }
+            $files | ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } | Set-Content -LiteralPath (Join-Path $directory 'SHA256SUMS.txt') -Encoding ascii
+          }
+
       - name: Upload Windows binaries
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
@@ -193,10 +231,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: codex-plus-plus-windows-installer
-          path: dist/windows/*.exe
+          path: |
+            dist/windows/*.exe
+            dist/windows/SHA256SUMS.txt
           if-no-files-found: error
 
   macos-dmg:
+    if: ${{ false }} # 此专用分支只构建 Windows。
     # PR / 推送 main 只做 cargo check：Windows、Linux 编不到 macOS 专属代码（录屏、objc 等），
     # 这里是唯一的编译检查。双架构通用包（ad-hoc 签名）只在手动触发时打，发版走 release-assets.yml。
     name: macOS DMG (universal)
@@ -301,6 +342,7 @@ jobs:
           if-no-files-found: error
 
   linux-deb:
+    if: ${{ false }}
     name: Linux DEB (Ubuntu 24.04, amd64)
     runs-on: ubuntu-24.04
     steps:
